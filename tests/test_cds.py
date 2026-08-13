@@ -35,7 +35,26 @@ def test_results_url_falls_back_to_location():
     assert results_url(res) == "https://obj/y.zip"
 
 
+# --------------------------------------------------------------------------- #
+# curl 返回码 0 不代表文件完整：代理静默截断连接时 curl 仍可能报 rc=0（把提前
+# 关闭的连接当作正常结束）。所以 curl_download 必须额外问一次远端 Content-
+# Length（HEAD），下载后比对本地文件大小，不够就当失败走重试——而不是只信 rc。
+#
+# 注意 ``-C -`` 续传下 curl 自己的 %{size_download}/%{content_length_download}
+# 只反映"这一次尝试"的字节数，不是文件总长，不能拿来跟本地文件比——所以校验
+# 总长必须另问远端一次，测试里用 requests.head 打桩模拟这个远端应答。
+# --------------------------------------------------------------------------- #
+def _stub_head(monkeypatch, content_length: int | None = None):
+    """打桩 requests.head，避免 curl_download 内部的大小校验发出真实 HEAD
+    请求。content_length=None 模拟远端不给 Content-Length（校验被跳过，
+    退回『rc==0 即成功』）；给数字则模拟服务器声明的对象总长度。"""
+    import requests
+    headers = {} if content_length is None else {"Content-Length": str(content_length)}
+    monkeypatch.setattr(requests, "head", lambda url, **kw: SimpleNamespace(headers=headers))
+
+
 def test_curl_download_passes_proxy_and_resume_flags(monkeypatch, tmp_path: Path):
+    _stub_head(monkeypatch)   # 不关心大小校验，跳过（无 Content-Length）
     seen = {}
 
     def fake_run(cmd, **kw):
@@ -53,6 +72,7 @@ def test_curl_download_passes_proxy_and_resume_flags(monkeypatch, tmp_path: Path
 
 
 def test_curl_download_omits_proxy_when_none(monkeypatch, tmp_path: Path):
+    _stub_head(monkeypatch)   # 不关心大小校验，跳过（无 Content-Length）
     seen = {}
 
     def fake_run(cmd, **kw):
@@ -68,8 +88,50 @@ def test_curl_download_omits_proxy_when_none(monkeypatch, tmp_path: Path):
 def test_curl_download_raises_after_attempts(monkeypatch, tmp_path: Path):
     # 失败重试之间会 sleep 退避；打桩掉 time.sleep 而不是真的等，测试要快。
     monkeypatch.setattr(time, "sleep", lambda s: None)
+    _stub_head(monkeypatch)   # 不关心大小校验，跳过（无 Content-Length）
     monkeypatch.setattr(subprocess, "run",
                         lambda cmd, **kw: SimpleNamespace(returncode=18))
+    with pytest.raises(RuntimeError, match="curl"):
+        curl_download("https://obj/x.zip", tmp_path / "o.bin", proxy=None, attempts=2)
+
+
+def test_curl_download_retries_when_rc_zero_but_file_too_short(monkeypatch, tmp_path: Path):
+    """核心回归用例：curl 说成功（rc=0）但文件比远端声明的总长短——必须不认账，
+    继续走重试（-C - 续传，不是从头下）而不是原样收下一个残缺文件。"""
+    _stub_head(monkeypatch, content_length=100)
+    monkeypatch.setattr(time, "sleep", lambda s: None)   # 重试间会退避，测试不真等
+    calls = []
+
+    def fake_run(cmd, **kw):
+        calls.append(cmd)
+        target = Path(cmd[cmd.index("-o") + 1])
+        if len(calls) == 1:
+            target.write_bytes(b"x" * 40)          # 被截断：只有 40/100 字节
+        else:
+            with target.open("ab") as f:            # 续传：接着补满
+                f.write(b"y" * 60)
+        return SimpleNamespace(returncode=0)         # curl 自己认为成功了
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    target = tmp_path / "out.bin"
+    curl_download("https://obj/x.zip", target, proxy=None)
+
+    assert len(calls) == 2                           # 第一次"成功"但太短，必须重试
+    assert target.read_bytes() == b"x" * 40 + b"y" * 60
+    assert target.stat().st_size == 100
+
+
+def test_curl_download_raises_if_persistently_short(monkeypatch, tmp_path: Path):
+    """反复都拿不到完整大小——用尽 attempts 后必须报错，不能把残缺文件当成功。"""
+    _stub_head(monkeypatch, content_length=100)
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+
+    def fake_run(cmd, **kw):
+        target = Path(cmd[cmd.index("-o") + 1])
+        target.write_bytes(b"x" * 40)   # 每次都只给 40/100 字节，rc 却是 0
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
     with pytest.raises(RuntimeError, match="curl"):
         curl_download("https://obj/x.zip", tmp_path / "o.bin", proxy=None, attempts=2)
 

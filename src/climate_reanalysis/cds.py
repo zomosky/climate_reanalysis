@@ -65,11 +65,43 @@ def results_url(results) -> str:
     raise RuntimeError("结果里没有对象存储 URL")
 
 
+def _expected_size(url: str, proxy: str | None) -> int | None:
+    """HEAD 一次问远端 Content-Length，用来判断下载有没有被静默截断。
+
+    代理故障或链路抖动时，服务端/代理可能提前关闭连接，而 curl 把这当作
+    正常结束、返回码仍是 0——只信 rc 会把半个文件当成功收下。``-C -``
+    续传模式下 curl 自己的 %{size_download}/%{content_length_download}
+    只反映"这一次尝试"下载/剩余的字节数，不是文件总长，没法拿来跟本地
+    文件比对，所以总长必须另问远端一次。
+
+    拿不到（HEAD 被拒绝、超时、没有 Content-Length 头——部分预签名 URL
+    确实不支持 HEAD）时返回 None，调用方据此跳过大小校验、退回旧的
+    "rc==0 即成功"判据：宁可放过一次校验，也不能让探测本身的网络问题
+    把一次正常下载误判成失败。
+    """
+    import requests
+
+    try:
+        proxies = {"http": proxy, "https": proxy} if proxy else None
+        resp = requests.head(url, proxies=proxies, timeout=30, allow_redirects=True)
+        cl = resp.headers.get("Content-Length")
+        return int(cl) if cl is not None else None
+    except Exception as exc:  # noqa: BLE001 - 探测失败不阻断下载，只是校验退化
+        log.warning("expected_size_probe_failed", url=url, error=str(exc))
+        return None
+
+
 def curl_download(url: str, target: Path, proxy: str | None,
                   attempts: int = 8) -> None:
-    """可续传下载。``-C -`` 使断掉的传输接着传而不是重来。"""
+    """可续传下载。``-C -`` 使断掉的传输接着传而不是重来。
+
+    curl 返回码 0 不代表文件完整（见 ``_expected_size`` 的注释）——下载完
+    额外比对本地文件大小与远端声明的总长，不够则视为失败继续重试（沿用
+    已经落盘的部分续传，不是从头再来）。
+    """
     target = Path(target)
     target.parent.mkdir(parents=True, exist_ok=True)
+    expected = _expected_size(url, proxy)   # 只探测一次，url 在各次尝试间不变
     for i in range(1, attempts + 1):
         cmd = ["curl", "-sSL", "-C", "-", "--retry", "3", "--retry-delay", "5",
                "--retry-all-errors", "--connect-timeout", "30", "--fail"]
@@ -77,9 +109,14 @@ def curl_download(url: str, target: Path, proxy: str | None,
             cmd += ["-x", proxy]
         cmd += ["-o", str(target), url]
         r = subprocess.run(cmd)
-        if r.returncode == 0:
+        have = target.stat().st_size if target.exists() else 0
+        if r.returncode == 0 and (expected is None or have >= expected):
             return
-        log.warning("curl_failed", rc=r.returncode, attempt=i, target=str(target))
+        if r.returncode == 0:
+            log.warning("curl_size_mismatch", have=have, expected=expected,
+                       attempt=i, target=str(target))
+        else:
+            log.warning("curl_failed", rc=r.returncode, attempt=i, target=str(target))
         if i < attempts:  # 最后一次失败后没有下一次尝试，不必再空等再报错
             time.sleep(min(10 * i, 60))
     raise RuntimeError(f"curl 下载失败（{attempts} 次）: {url}")

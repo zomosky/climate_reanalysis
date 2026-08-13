@@ -8,11 +8,14 @@ import numpy as np
 import xarray as xr
 import zarr
 
+import pytest
+
 from climate_reanalysis.store import (
     CHUNK,
     SHARD,
     TARGET_LAT,
     TARGET_LON,
+    check_area_matches_grid,
     ensure_store,
     has_data,
     read_provenance,
@@ -27,6 +30,19 @@ def test_grid_matches_zrread_contract():
     assert TARGET_LAT.size == 161 and TARGET_LON.size == 281
     assert TARGET_LAT[0] == 15.0 and TARGET_LAT[-1] == 55.0
     assert TARGET_LON[0] == 70.0 and TARGET_LON[-1] == 140.0
+
+
+def test_check_area_matches_grid_accepts_the_matching_area():
+    check_area_matches_grid((55.0, 70.0, 15.0, 140.0))   # N, W, S, E——不报错
+
+
+def test_check_area_matches_grid_rejects_drifted_area():
+    """area 与 TARGET_LAT/TARGET_LON 是两份独立的真值，没有互相校验就会各自
+    漂移——改错 area 不会在下载时报错，要等整月下载完进 restore 才报"网格
+    不符"，代价是白白花掉的 CDS 配额和数小时带宽。这里在真的提交任何请求
+    之前就把配置错误拦下来。"""
+    with pytest.raises(ValueError, match="网格"):
+        check_area_matches_grid((55.0, 70.0, 16.0, 140.0))   # S 打错了一度
 
 
 def test_ensure_store_creates_all_nine_variables_as_nan(tmp_path: Path):

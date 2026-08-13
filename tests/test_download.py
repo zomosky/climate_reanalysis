@@ -7,6 +7,8 @@ import threading
 import time
 from pathlib import Path
 
+import pytest
+
 from climate_reanalysis.download import (
     build_request,
     download_many,
@@ -53,6 +55,23 @@ def test_request_shape_is_month_and_area(monkeypatch, tmp_path: Path):
     assert req["year"] == ["2026"] and req["month"] == ["01"]
     assert len(req["day"]) == 31 and len(req["time"]) == 24
     assert req["area"] == [55.0, 70.0, 15.0, 140.0]
+
+
+def test_download_many_rejects_area_that_drifted_from_grid(monkeypatch, tmp_path: Path):
+    """settings.area 与 store.TARGET_LAT/TARGET_LON 是两份独立的真值——改错
+    area 不会在下载时报错，要等整月下载完进 restore 才报"网格不符"，代价是
+    白白花掉的 CDS 配额和数小时带宽。必须在提交任何真实请求之前就拦下来：
+    这里断言一个请求都没发出去（c.requests 为空），不只是断言最终抛了错。"""
+    s = Settings(raw_dir=tmp_path / "raw", manifest_dir=tmp_path / "m",
+                store_dir=tmp_path / "s", dl_proxy=None,
+                area=(55.0, 70.0, 16.0, 140.0))   # S 打错了一度，不再匹配契约网格
+    c = FakeClient()
+    _fake_retrieve(monkeypatch, c)
+
+    with pytest.raises(ValueError, match="网格"):
+        download_many(s, c, ["202601"], ["t2m"], TODAY)
+
+    assert c.requests == []
 
 
 def test_not_ready_month_is_skipped(monkeypatch, tmp_path: Path):

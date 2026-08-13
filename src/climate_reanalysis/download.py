@@ -22,6 +22,7 @@ from climate_reanalysis.cds import retrieve
 from climate_reanalysis.logging_setup import get_logger
 from climate_reanalysis.manifest import manifest_path, write_manifest
 from climate_reanalysis.period import is_ready
+from climate_reanalysis.store import check_area_matches_grid
 from climate_reanalysis.variables import cds_variables
 
 log = get_logger(__name__)
@@ -110,7 +111,13 @@ def download_many(settings, client, months: list[str], variables: list[str],
     ``cleanup_account_failed_jobs`` 的显式独立入口。即使本轮全部缓存命中、
     一个都没下（job_ids 为空），也照样调用一次——只是没有 id 可清，天然是
     个空操作，不需要特判。
+
+    启动期先校验 ``settings.area`` 与契约网格是否吻合（``check_area_matches_grid``）
+    ——改错 area 不会在下载时报错，要等整月下载完进 restore 才会报"网格不符"，
+    代价是白白花掉的 CDS 配额和数小时带宽；这里几乎零成本，在提交任何真实
+    请求之前就把配置错误拦下来。
     """
+    check_area_matches_grid(settings.area)
     ok: list[tuple[str, str]] = []
     failed: list[tuple[str, str, str]] = []
     job_ids: list[str] = []

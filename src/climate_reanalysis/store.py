@@ -38,6 +38,29 @@ def store_path(store_dir: Path, month: str) -> Path:
     return Path(store_dir) / f"{month}_era5.zarr"
 
 
+def check_area_matches_grid(area: tuple[float, float, float, float]) -> None:
+    """``settings.area``（N, W, S, E）必须与本模块的契约网格
+    ``TARGET_LAT``/``TARGET_LON`` 的首末格点吻合——这是两份独立的真值，没有
+    互相校验就会各自漂移。
+
+    改错 area 不会在下载时报错：CDS 老老实实按错的框给数据，下载本身完全
+    "成功"。要等到整月下载完、进 restore 时 ``load_raw`` 逐文件核对网格才会
+    报"网格不符"——代价是已经白白花掉的 CDS 排队配额和数小时带宽。这个比较
+    本身几乎零成本，宁可在提交任何真实请求之前的启动期就把配置错误拦下来。
+    """
+    n, w, s, e = area
+    expect = (float(TARGET_LAT[-1]), float(TARGET_LON[0]),
+             float(TARGET_LAT[0]), float(TARGET_LON[-1]))
+    got = (float(n), float(w), float(s), float(e))
+    if any(abs(a - b) > _TOL for a, b in zip(got, expect)):
+        en, ew, es, ee = expect
+        raise ValueError(
+            f"settings.area {area}（N,W,S,E）与契约网格不符：期望 "
+            f"(N={en}, W={ew}, S={es}, E={ee})——area 与 store.TARGET_LAT/"
+            f"TARGET_LON 是两份独立的真值，改一处必须同步改另一处"
+        )
+
+
 def _skeleton_is_complete(path: Path) -> bool:
     """完整性判据：consolidated 元数据存在，且骨架坐标与全部变量齐全。
 

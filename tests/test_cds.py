@@ -45,12 +45,19 @@ def test_results_url_falls_back_to_location():
 # 总长必须另问远端一次，测试里用 requests.head 打桩模拟这个远端应答。
 # --------------------------------------------------------------------------- #
 def _stub_head(monkeypatch, content_length: int | None = None):
-    """打桩 requests.head，避免 curl_download 内部的大小校验发出真实 HEAD
-    请求。content_length=None 模拟远端不给 Content-Length（校验被跳过，
-    退回『rc==0 即成功』）；给数字则模拟服务器声明的对象总长度。"""
+    """打桩 requests.Session.head，避免 curl_download 内部的大小校验发出真实
+    HEAD 请求。content_length=None 模拟远端不给 Content-Length（校验被跳过，
+    退回『rc==0 即成功』）；给数字则模拟服务器声明的对象总长度。
+
+    打在 ``Session.head``（而非模块级 ``requests.head``）上——``_expected_size``
+    走的是自建的 trust_env=False session，不再调用模块级函数。"""
     import requests
     headers = {} if content_length is None else {"Content-Length": str(content_length)}
-    monkeypatch.setattr(requests, "head", lambda url, **kw: SimpleNamespace(headers=headers))
+
+    def fake_head(self, url, **kw):
+        return SimpleNamespace(headers=headers)
+
+    monkeypatch.setattr(requests.Session, "head", fake_head)
 
 
 def test_curl_download_passes_proxy_and_resume_flags(monkeypatch, tmp_path: Path):
@@ -137,7 +144,64 @@ def test_curl_download_raises_if_persistently_short(monkeypatch, tmp_path: Path)
 
 
 # --------------------------------------------------------------------------- #
-# target.exists() 是 download_one 的缓存判据（"文件在=已完整"）。如果 curl 直接
+# HEAD 探测必须跟 submit/poll 一样直连（trust_env=False），否则在有本地系统
+# 代理（Clash）的机器上会被代理接管；代理不通时探测异常，若这条异常被静默吞掉
+# 就等于把 Task 6 加上的截断校验悄悄关掉。这两条用例分别钉住"用的是直连
+# session"和"探测失败必须出声"。
+# --------------------------------------------------------------------------- #
+def test_expected_size_probe_uses_trust_env_false_session(monkeypatch, tmp_path: Path):
+    """跟 test_make_client_forces_trust_env_false 同一手法：打桩 requests.Session
+    为一个 trust_env 默认 True 的假类，断言 _expected_size 用之前把它显式设成
+    False，而不是让它保持 requests.Session() 的真实默认值。"""
+    import requests
+
+    captured = {}
+
+    class FakeSession:
+        def __init__(self):
+            self.trust_env = True   # requests.Session 的真实默认值
+
+        def head(self, url, **kw):
+            captured["trust_env"] = self.trust_env
+            return SimpleNamespace(headers={"Content-Length": "4"})
+
+    monkeypatch.setattr(requests, "Session", FakeSession)
+
+    def fake_run(cmd, **kw):
+        Path(cmd[cmd.index("-o") + 1]).write_bytes(b"data")
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    curl_download("https://obj/x.zip", tmp_path / "out.bin", proxy=None)
+
+    assert captured["trust_env"] is False
+
+
+def test_expected_size_probe_failure_warns_instead_of_silently_degrading(
+    monkeypatch, tmp_path: Path, capsys
+):
+    """探测异常（例如代理不通）会让截断校验退化成『rc==0 即成功』——这个退化
+    本身必须出声，不能悄无声息，否则没人知道这次下载其实没有做大小校验。"""
+    import requests
+
+    def raising_head(self, url, **kw):
+        raise RuntimeError("proxy refused connection")
+
+    monkeypatch.setattr(requests.Session, "head", raising_head)
+
+    def fake_run(cmd, **kw):
+        Path(cmd[cmd.index("-o") + 1]).write_bytes(b"data")
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    curl_download("https://obj/x.zip", tmp_path / "out.bin", proxy=None)
+
+    out = capsys.readouterr().out
+    assert "expected_size_probe_failed" in out
+
+
+# --------------------------------------------------------------------------- #
+# target.exists() 是 download_one 的缓存判据("文件在=已完整")。如果 curl 直接
 # 写 target，半途被杀（OOM/断电/curl 重试耗尽）会在 target 位置留下一个残缺文件——
 # 下次 cron 起来会把这个残缺文件当成"已经下好"，连 size_bytes/sha256 一起原样
 # 写进 manifest，向下游撒谎。必须写到 <target>.part，通过大小校验才 rename 成

@@ -39,14 +39,27 @@ def read_cdsapirc(path: Path | None = None) -> tuple[str, str]:
     return url, key
 
 
+def _direct_session():
+    """trust_env=False 的 requests.Session：忽略 env 与 macOS 系统代理。
+
+    submit/poll（``make_client``）与 HEAD 探测（``_expected_size``）共用同一条
+    直连约定——探测走漏了这条约定，代理不通时探测请求会被代理吞掉/挂起，
+    异常又被 ``_expected_size`` 自己的 except 悄悄吃掉，等于把截断校验关掉
+    而不自知。
+    """
+    import requests
+
+    sess = requests.Session()
+    sess.trust_env = False
+    return sess
+
+
 def make_client(settings):
     """直连的 datastores client（submit/poll 不走代理）。"""
     import ecmwf.datastores
-    import requests
 
     url, key = read_cdsapirc(settings.cdsapirc)
-    sess = requests.Session()
-    sess.trust_env = False       # 同时忽略 env 与 macOS 系统代理
+    sess = _direct_session()
     return ecmwf.datastores.Client(url=url, key=key, session=sess,
                                    retry_after=60, maximum_tries=500)
 
@@ -77,16 +90,22 @@ def _expected_size(url: str, proxy: str | None) -> int | None:
     拿不到（HEAD 被拒绝、超时、没有 Content-Length 头——部分预签名 URL
     确实不支持 HEAD）时返回 None，调用方据此跳过大小校验、退回旧的
     "rc==0 即成功"判据：宁可放过一次校验，也不能让探测本身的网络问题
-    把一次正常下载误判成失败。
-    """
-    import requests
+    把一次正常下载误判成失败。**退化必须出声**——探测失败意味着这次下载
+    的截断校验此刻是关的，静默吞掉异常会让人误以为校验一直在生效。
 
+    HEAD 用跟 submit/poll 一样的 ``trust_env=False`` 直连 session（``proxies``
+    参数只是「显式覆盖」，``trust_env=True`` 时 requests 仍会在它之外读取
+    macOS 系统代理/环境变量）——否则本机 Clash 之类的系统代理会插到这次探测
+    请求上；代理不通时探测异常，被这里的 except 吃掉退化成"rc==0 即成功"，
+    等于把 Task 6 好不容易加上的截断校验悄悄关掉，而调用方毫不知情。
+    """
     try:
+        sess = _direct_session()
         proxies = {"http": proxy, "https": proxy} if proxy else None
-        resp = requests.head(url, proxies=proxies, timeout=30, allow_redirects=True)
+        resp = sess.head(url, proxies=proxies, timeout=30, allow_redirects=True)
         cl = resp.headers.get("Content-Length")
         return int(cl) if cl is not None else None
-    except Exception as exc:  # noqa: BLE001 - 探测失败不阻断下载，只是校验退化
+    except Exception as exc:  # noqa: BLE001 - 探测失败不阻断下载，只是校验退化——但必须出声
         log.warning("expected_size_probe_failed", url=url, error=str(exc))
         return None
 

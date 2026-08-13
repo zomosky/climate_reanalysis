@@ -12,7 +12,7 @@ from climate_reanalysis.manifest import manifest_path, write_manifest
 from climate_reanalysis.period import month_hours
 from climate_reanalysis.restore import restore_one, scan_once
 from climate_reanalysis.settings import Settings
-from climate_reanalysis.store import TARGET_LAT, read_provenance, store_path
+from climate_reanalysis.store import TARGET_LAT, TARGET_LON, read_provenance, store_path
 from tests.conftest import make_raw_nc
 
 AREA = (55.0, 70.0, 15.0, 140.0)
@@ -94,6 +94,52 @@ def test_si10_hypot_from_two_files(tmp_path: Path):
     restore_one(s, mf)
     ds = xr.open_zarr(store_path(s.store_dir, "202601"), consolidated=True)
     np.testing.assert_allclose(ds["si10"].values[0, 0, 0], 5.0)
+
+
+def _make_raw_nc_with_data_var_names(path: Path, month: str, names: list[str],
+                                     value: float = 3600.0) -> Path:
+    """同 conftest.make_raw_nc 的原生形态（valid_time、纬度降序），但数据变量名
+    可以跟请求的 cds 变量名不一致、也可以放不止一个——用来模拟真实 CDS 文件
+    （GRIB shortName，如 't'/'u'，从不等于 cds_var 长名）与"文件里混进第二个
+    数据变量"这两种 load_raw 的 fallback 分支场景。"""
+    t = month_hours(month)
+    lat = TARGET_LAT[::-1]
+    lon = TARGET_LON
+    shape = (t.size, lat.size, lon.size)
+    data = {name: (("valid_time", "latitude", "longitude"),
+                   np.full(shape, value, dtype="float32")) for name in names}
+    ds = xr.Dataset(data, coords={"valid_time": t, "latitude": lat, "longitude": lon})
+    path.parent.mkdir(parents=True, exist_ok=True)
+    ds.to_netcdf(path)
+    return path
+
+
+def test_load_raw_uses_sole_data_var_when_name_is_a_grib_shortname(tmp_path: Path):
+    """真实 CDS netCDF 的数据变量名是 GRIB shortName（如 t2m 对应的长名
+    2m_temperature，文件里的变量却叫 't2m' 甚至更短的 't'），从不等于
+    cds_var 长名——第一个分支（cds_var in ds.data_vars）在真实数据上永远不
+    命中，永远走 fallback。唯一一个数据变量时应正常按位置取用，不能因为
+    名字不完全匹配就报错。"""
+    s = _settings(tmp_path)
+    f = _make_raw_nc_with_data_var_names(
+        s.raw_dir / "202601" / "2m_temperature.nc", "202601", ["t2m"], value=280.0)
+    mf = write_manifest(s.manifest_dir, "202601", "t2m", [f], AREA)
+    assert restore_one(s, mf) == "done"
+    ds = xr.open_zarr(store_path(s.store_dir, "202601"), consolidated=True)
+    np.testing.assert_allclose(ds["t2m"].values[0, 0, 0], 280.0)
+
+
+def test_load_raw_rejects_ambiguous_multi_data_var_file(tmp_path: Path):
+    """fallback 分支（真实数据的唯一路径）此前既没测试覆盖、也不校验数量：
+    文件里若有第二个数据变量，会静默取 list(ds.data_vars)[0]，取错变量却
+    没有任何报错。必须报错点名有哪些数据变量。"""
+    s = _settings(tmp_path)
+    f = _make_raw_nc_with_data_var_names(
+        s.raw_dir / "202601" / "2m_temperature.nc", "202601", ["t2m", "extra"])
+    mf = write_manifest(s.manifest_dir, "202601", "t2m", [f], AREA)
+    with pytest.raises(ValueError, match="数据变量"):
+        restore_one(s, mf)
+    assert not store_path(s.store_dir, "202601").exists()
 
 
 def test_scan_once_counts_and_is_idempotent(tmp_path: Path, monkeypatch):

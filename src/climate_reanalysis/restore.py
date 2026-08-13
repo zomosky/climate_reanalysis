@@ -61,7 +61,22 @@ def load_raw(files: list[Path], var: str, month: str) -> np.ndarray:
         if len(hit) != 1:
             raise ValueError(f"{var}: 找不到唯一的 {cds_var} 文件（{[q.name for q in paths]}）")
         ds = _open_one(hit[0])
-        name = cds_var if cds_var in ds.data_vars else list(ds.data_vars)[0]
+        if cds_var in ds.data_vars:
+            name = cds_var
+        else:
+            # 真实 CDS netCDF 用的是 GRIB shortName（t/u/r 这种），不是 CDS 长
+            # 变量名——上面这个分支在真实数据上永远不命中，每次都走到这里。
+            # 唯一一个数据变量时按位置取用没有歧义；但文件里若混进了第二个数据
+            # 变量，静默取 list(...)[0] 会不声不响地写错变量进库——必须报错
+            # 点名，不能猜。
+            data_vars = list(ds.data_vars)
+            if len(data_vars) != 1:
+                raise ValueError(
+                    f"{var}/{cds_var}（{hit[0].name}）: 期望恰好一个数据变量"
+                    f"（真实 CDS 文件用 GRIB shortName、非 {cds_var}），实际有 "
+                    f"{len(data_vars)} 个：{data_vars}"
+                )
+            name = data_vars[0]
         da = ds[name].sortby("latitude").sortby("longitude").sortby("time")
         lat = da["latitude"].values
         lon = da["longitude"].values

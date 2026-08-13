@@ -68,6 +68,25 @@ def test_download_requires_explicit_start(tmp_path, monkeypatch):
         cli.main(["--config", str(cfg), "download"])
 
 
+def test_explicit_missing_config_errors_instead_of_running_with_defaults(tmp_path):
+    """显式传入却不存在的 --config 必须报错——静默退回默认配置会表现成
+    "处理 0 个、退出码 0"，运维会以为一切正常（真实场景：manifest_dir 打错，
+    restore 对着一个空目录扫，什么都没做却"成功"退出）。"""
+    missing = tmp_path / "does-not-exist.yaml"
+    with pytest.raises(FileNotFoundError):
+        cli.main(["--config", str(missing), "restore"])
+
+
+def test_no_config_flag_falls_back_to_defaults_when_conventional_path_absent(
+    tmp_path, monkeypatch
+):
+    """不传 --config 时走约定路径 config/settings.yaml；那个路径本身不存在
+    （例如刚 clone 仓库还没 cp 配置样例）不该报错——退回出厂默认值，无害子
+    命令（这里用 restore：默认 manifest_dir 下没有任何 manifest）照常返回 0。"""
+    monkeypatch.chdir(tmp_path)   # cwd 下没有 config/settings.yaml
+    assert cli.main(["restore"]) == 0
+
+
 def test_cleanup_jobs_is_a_separate_explicit_entry_point(tmp_path, monkeypatch):
     """cleanup-jobs 是账号级清理（不限本批）——必须是一个要显式敲出来的独立
     子命令，且要调用 cleanup_account_failed_jobs 而不是 download_many 收尾

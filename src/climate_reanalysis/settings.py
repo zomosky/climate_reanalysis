@@ -40,9 +40,19 @@ def _anchor(base: Path, p: Path) -> Path:
 
 
 def load_settings(path: Path | None = None) -> Settings:
-    if path is None or not Path(path).exists():
+    """``path=None`` 用出厂默认值（无需报错——CLI 用它表达"没有可用的配置文件，
+    退回默认"这种约定俗成的场景）；显式给了一个路径就必须存在，不存在报错。
+
+    这条不对称是有意的：此前不管 ``path`` 是 ``None`` 还是显式传入但打错的
+    路径，缺文件都静默退回默认值——CLI 层面表现成"处理 0 个、退出码 0"，
+    运维会以为一切正常。是否"显式"这件事由调用方（cli.py）判断并决定传
+    ``None`` 还是具体路径，本函数只按"给没给路径"这一条分支。
+    """
+    if path is None:
         return Settings()
     path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"--config 指定的配置文件不存在: {path}")
     raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     s = Settings.model_validate(raw)
     base = path.parent.parent if path.parent.name == "config" else path.parent

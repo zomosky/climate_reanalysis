@@ -24,6 +24,24 @@ from climate_reanalysis.variables import VAR_SPECS
 
 log = get_logger(__name__)
 
+#: 约定的默认配置文件位置——只在用户没有显式传 --config 时才生效。
+_DEFAULT_CONFIG = Path("config/settings.yaml")
+
+
+def _resolve_config_path(explicit: Path | None) -> Path | None:
+    """解析 --config：显式传入的路径原样交给 load_settings（不存在会报错，见其
+    docstring）；没传则按约定路径，约定路径也不存在就交回 None（load_settings
+    据此退回出厂默认值，不报错）。
+
+    这条"约定路径缺失就静默用默认值、显式传入缺失就报错"的不对称必须在这里
+    （而不是 load_settings 内部）判断——argparse 的 default 值一旦落进
+    args.config，load_settings 单看这一个参数已经分不清"用户没传"和"用户
+    传的正好等于约定路径"，必须由调用方在解析阶段就把这两种情况分开。
+    """
+    if explicit is not None:
+        return explicit
+    return _DEFAULT_CONFIG if _DEFAULT_CONFIG.exists() else None
+
 
 def cmd_download(args) -> int:
     s = load_settings(args.config)
@@ -74,7 +92,12 @@ def cmd_list_variables(args) -> int:
 def main(argv=None) -> int:
     configure()
     p = argparse.ArgumentParser(prog="climate_reanalysis")
-    p.add_argument("--config", type=Path, default=Path("config/settings.yaml"))
+    p.add_argument("--config", type=Path, default=None, help=(
+        "配置文件路径；不传则用约定的 config/settings.yaml（那个文件存在才用，"
+        "不存在就退回出厂默认值，不报错——方便刚 clone 仓库、还没 cp 配置样例时"
+        "先跑 list-variables 之类不依赖配置的子命令）。显式传入的路径必须存在，"
+        "否则报错——避免 typo 静默用错配置、表现成'处理 0 个、退出码 0'"
+    ))
     sub = p.add_subparsers(dest="cmd", required=True)
 
     d = sub.add_parser("download", help="按（月×产出变量）下载并写 manifest")
@@ -109,6 +132,7 @@ def main(argv=None) -> int:
     lv.set_defaults(func=cmd_list_variables)
 
     args = p.parse_args(argv)
+    args.config = _resolve_config_path(args.config)
     return args.func(args)
 
 

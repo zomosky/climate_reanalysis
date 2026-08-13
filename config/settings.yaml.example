@@ -1,11 +1,22 @@
-# 复制为 config/settings.yaml 后按机器修改（真实文件不入版本库）
+# 复制为 config/settings.yaml 后按机器修改（真实文件不入版本库）。
+#
+# 这份样例本身必须是中性占位值——它的用途就是被复制到别的机器改一改就用，
+# 照抄本机的真实路径/代理会在别的机器上静默建目录、连一个不存在的代理。
+# "本机是这样、服务器是那样"这类信息写在注释里说明，不要写进默认值。
+
 raw_dir: data/raw
 manifest_dir: data/manifests
-store_dir: /Volumes/TUF/climate/era5/monthly
+# 月度国网库落盘位置——相对路径会锚定到本项目根目录（config/ 的父目录）。
+# 本机测试期示例：/Volumes/TUF/climate/era5/monthly（外接盘，按需改）。
+# 服务器示例（比照本仓库其它管线的存储约定，具体以实际部署为准）：
+# /training_data/climate_data/era5/monthly。
+store_dir: data/monthly
 
-# bulk download 走的代理；留空 = 裸连。submit/poll 一律直连。
-# 本机 Clash 实测 4.8 MB/s，服务器无代理裸连仅 10.6 KB/s。
-dl_proxy: http://127.0.0.1:7890
+# bulk download 走的代理；留空 = 裸连，submit/poll 一律直连（跟这里无关）。
+# 本机若有本地代理（如 Clash，默认端口 7890）可填 http://127.0.0.1:7890，
+# 实测约 4.8 MB/s；服务器目前无代理，留空裸连（实测约 10.6 KB/s，很慢，
+# 属于已知取舍——见 README「已知取舍」）。
+dl_proxy:
 
 # 链路退化时（日志频现 curl rc=18）调低到 1-2
 concurrency: 4

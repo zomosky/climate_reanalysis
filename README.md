@@ -63,7 +63,9 @@ url: https://cds.climate.copernicus.eu/api
 key: <your-key>
 ```
 
-## 两个单元怎么调
+## download / restore 怎么调
+
+（`migrate` 见下方「历史迁移」一节；账号级 job 清理见「CDS 失败 job 清理」一节）
 
 ```bash
 # 列出九个产出变量与其 CDS 来源
@@ -78,8 +80,11 @@ uv run climate_reanalysis download --start 202501 --months 202501 --variables ss
 uv run climate_reanalysis restore
 ```
 
-`--config` 是顶层参数，写在子命令**之前**：`climate_reanalysis --config path/to/settings.yaml download ...`；
-不传则用相对 CWD 的 `config/settings.yaml`。
+`--config` 是顶层参数，写在子命令**之前**：`climate_reanalysis --config path/to/settings.yaml download ...`。
+不传时用约定的 `config/settings.yaml`（相对 CWD）——那个文件存在才用，不存在就退回出厂
+默认值，不报错（方便刚 clone 仓库、还没 `cp` 配置样例时先跑 `list-variables` 之类不依赖
+配置的子命令）。**显式传入的 `--config` 路径必须存在，不存在会报错**——不会像早期实现那样
+静默退回默认配置、表现成"处理 0 个、退出码 0"让人误以为一切正常。
 
 `--start` **必填、没有默认值**（哪怕搭配 `--months` 显式指定月份也要传，argparse 不看
 业务逻辑）——这是有意的：见下方「历史迁移」一节末尾的说明，一个"看起来无害"的默认值
@@ -88,6 +93,24 @@ uv run climate_reanalysis restore
 `download` 未就绪时不联网、不报错，直接跳过并返回退出码 0（同月其它变量互不影响）；
 `restore` 全部成功退出码 0，有已就绪的 manifest 处理失败则非 0（同 `climate_restorage`
 的 `scan-once`）。
+
+## CDS 失败 job 清理
+
+失败/被拒的 CDS job 会一直占着排队配额，不清理会越积越多。`download` 每轮收尾会
+**自动**清理，但**只清理这一轮自己 submit 得到的 job**，不碰账号上的其它任务——
+同一个 CDS 账号上完全可能正跑着别的批次（例如另一段历史回填），账号级不分青红皂白
+地全清会把它们一并删掉。
+
+如果需要清空账号上**全部**失败/被拒 job（不限本批，例如账号里堆积了旧脚本、别的
+项目留下的失败 job），用独立的子命令，需要显式敲出来：
+
+```bash
+uv run climate_reanalysis cleanup-jobs
+uv run climate_reanalysis cleanup-jobs --statuses failed   # 只清 failed，不动 rejected
+```
+
+**这条命令不会被 `download`/`restore` 自动调用**——它是危险操作，误删同账号上别人
+正跑着的任务没有撤销的余地，只应该在确认清楚账号上都是自己的任务时手动执行。
 
 ## 历史迁移（一次性）
 
@@ -132,20 +155,27 @@ uv run climate_reanalysis migrate \
 
 ## 挂定时任务
 
-`restore` 是幂等的，重复跑安全，可以直接挂 cron。服务器（无代理）：
+`restore` 是幂等的，重复跑安全，可以直接挂 cron。**必须加 `flock`**：`download` 单轮
+可能跑十几小时（排队常 1–1.5 小时/请求，一批几十个变量顺序等下来很容易跨天），如果
+cron 按"每天一次"这种周期挂，上一轮还没跑完下一轮就起来了——两个进程会对同一
+(月×变量) 各提交一次真实 CDS 请求（重复占配额），还会同时 curl 写同一个 `.part`
+文件互相踩踏。`restore` 单轮通常很快，但同样建议统一加锁，成本很低。服务器（无代理）：
 
 ```cron
-30 6 * * * cd /path/to/climate_reanalysis && uv run climate_reanalysis restore >> /var/log/climate_reanalysis_restore.log 2>&1
+30 6 * * * flock -n /tmp/climate_reanalysis_restore.lock -c "cd /path/to/climate_reanalysis && uv run climate_reanalysis restore >> /var/log/climate_reanalysis_restore.log 2>&1"
 ```
 
-`download` 同样幂等（manifest 已存在的（月×变量）会跳过重复请求），但耗时长（排队常
-1–1.5 小时/请求），不建议塞进高频 cron；按月手动跑或用较宽松的周期（如每天一次）。
+`download` 同样幂等（manifest 已存在的（月×变量）会跳过重复请求），但耗时长，不建议
+塞进高频 cron；按月手动跑或用较宽松的周期（如每天一次，配合上面的 `flock` 防重入）。
 **`--start` 必须显式给一个在已迁移历史范围之后的月份**（例如迁移覆盖到 202412，这里
 就从 202501 起）——留空会报错，但传错了同样会把整段历史重新排队：
 
 ```cron
-0 3 * * * cd /path/to/climate_reanalysis && uv run climate_reanalysis download --start 202501 >> /var/log/climate_reanalysis_download.log 2>&1
+0 3 * * * flock -n /tmp/climate_reanalysis_download.lock -c "cd /path/to/climate_reanalysis && uv run climate_reanalysis download --start 202501 >> /var/log/climate_reanalysis_download.log 2>&1"
 ```
+
+`-n`（`--nb`，non-blocking）在锁已被占用时直接放弃退出，不排队等待——比阻塞式加锁更
+适合 cron：宁可这一轮不跑，也不要一堆等锁的进程越积越多。
 
 本机长跑请用 `launchd` 而非会话级看护进程——`caffeinate -ims` 只挡空闲休眠，挡不住
 合盖与电池休眠（会直接 SIGKILL 掉正在排队/下载的进程）。
@@ -158,6 +188,31 @@ uv run climate_reanalysis migrate \
 
 **状态存在产出里而非外部账本**——产出被删/被改，状态自然跟着变。外部账本会与现实
 脱节：本项目的前身就出过一次（账本声称最新，实际漏了 14 个新数据块且不报错）。
+
+## raw 清理后月库损坏：唯一不能自愈的路径，须手工恢复
+
+`raw_dir` 的说明写着"restore 成功后可删"——这在正常情况下没问题：`restore` 只在
+manifest 的 sha 与月库溯源不一致时才需要读 raw，一致就跳过，不会碰 raw。但 manifest
+**在**这件事，同时也是 `download` 判断"这个 (月×变量) 已经处理过、不用再下"的**唯一**
+依据（见上面「manifest 存在即早退」这条闸门）——如果月库本身之后又损坏或丢失（磁盘
+问题、误删某个月的 `.zarr`、诸如此类），而 raw 已经按建议清理掉了，就会卡进一个
+**两头都拒绝、谁也没法自己修好**的状态：
+
+- `restore` 每轮都会对这个 (月×变量) 报错（`load_raw` 找不到 raw 文件），退出码非 0；
+- `download` 看到 manifest 还在，直接跳过、不重新请求——它没有办法知道月库那边已经坏了。
+
+**恢复步骤**（确认月库确实丢失/损坏、需要重新走一遍下载后）：
+
+1. 确认受影响的 (月×变量)——可以从 `restore` 的报错日志（`restore_failed`，带
+   `manifest` 路径）里读到。
+2. 删掉这些 (月×变量) 对应的 manifest 文件：`data/manifests/<YYYYMM>_<变量>.manifest.json`
+   （单个 `rm`，或按月/变量批量写一段 shell/Python 删）。
+3. 重新跑 `download --start <月份> --months <月份> --variables <变量>`——manifest 已经
+   不在了，即使 raw 也不在，`download_one` 也会正常重新发起真实 CDS 请求、重新写 raw。
+4. 再跑一次 `restore` 补齐月库。
+
+这条路径本项目**不打算做成自动化**——「月库损坏」本身应当是罕见情况，自动删 manifest
+去触发重下有误删的风险（比如把一次误报当成真损坏），不如留给人工确认后手动处理。
 
 ## 目录结构
 

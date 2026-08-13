@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from climate_reanalysis.settings import Settings, load_settings
 
 
@@ -38,6 +40,16 @@ def test_absolute_paths_kept(tmp_path: Path):
 def test_missing_file_falls_back_to_defaults():
     s = load_settings(None)
     assert s.publish_lag_days == 5
+
+
+def test_explicit_missing_path_raises_instead_of_falling_back(tmp_path: Path):
+    """path=None 退回默认值是有意的约定（见上一条用例）；但显式传入却打错/
+    不存在的路径不能同样静默退回默认值——那会在 CLI 层面表现成"处理 0 个、
+    退出码 0"，运维会以为一切正常。这条不对称由调用方（是否传了 path）区分，
+    load_settings 本身只按"给没给路径"这一条分支：给了就必须存在。"""
+    missing = tmp_path / "config" / "does-not-exist.yaml"
+    with pytest.raises(FileNotFoundError):
+        load_settings(missing)
 
 
 def test_cdsapirc_expands_home_but_is_not_project_anchored(tmp_path):

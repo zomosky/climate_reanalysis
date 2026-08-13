@@ -49,6 +49,31 @@ def test_ensure_store_is_idempotent(tmp_path: Path):
     assert read_provenance(tmp_path, "202601")["ssrd"]["manifest_sha256"] == "abc"
 
 
+def test_ensure_store_rebuilds_a_skeleton_left_incomplete_by_a_crash(tmp_path: Path):
+    """建骨架途中崩溃的现实后果（审查实测）：库里只有 t2m 一个数组、没有
+    time/latitude/longitude 坐标，却被后续 write_variable 自己的 consolidate
+    标成「完整」——path.exists() 为真，永远不会被重建。
+
+    这里直接构造这种残缺状态（只建一个数组就 consolidate，模拟"崩溃前只做完
+    这一步"），断言 ensure_store 必须识别出它不完整并整体重建，而不是原样放行。
+    """
+    p = store_path(tmp_path, "202601")
+    g = zarr.open_group(str(p), mode="w")
+    g.create_array("t2m", shape=(31 * 24, 161, 281), dtype="float32")
+    zarr.consolidate_metadata(g.store)   # 残缺状态被就地"标记"成看似完整
+
+    # 修复前：path.exists() 为真就直接放行，下面的断言会在残缺库上失败。
+    result = ensure_store(tmp_path, "202601")
+    assert result == p
+
+    ds = xr.open_zarr(p, consolidated=True)
+    assert set(ds.data_vars) == {
+        "ssrd", "fdir", "ssrdc", "t2m", "d2m", "si10", "u100", "v100", "sp"
+    }
+    assert ds.sizes == {"time": 31 * 24, "latitude": 161, "longitude": 281}
+    assert np.isnan(ds["t2m"].values).all()   # 重建后是全 NaN 骨架，不是残缺数组里的垃圾值
+
+
 def test_write_variable_lands_values_and_provenance(tmp_path: Path):
     ensure_store(tmp_path, "202601")
     data = np.full((31 * 24, 161, 281), 3.5, dtype="float32")

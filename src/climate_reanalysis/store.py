@@ -31,18 +31,48 @@ CHUNK = 8       # 读取粒度（zarr v3 sharding）
 
 _PROV_KEY = "zrread_provenance"
 
+_SKELETON_COORDS = ("time", "latitude", "longitude")
+
 
 def store_path(store_dir: Path, month: str) -> Path:
     return Path(store_dir) / f"{month}_era5.zarr"
 
 
+def _skeleton_is_complete(path: Path) -> bool:
+    """完整性判据：consolidated 元数据存在，且骨架坐标与全部变量齐全。
+
+    ``path.exists()``（目录在）不等于「骨架建完」——建骨架途中崩溃会在磁盘上
+    留下一个只有部分数组、缺坐标的 group；若拿路径存在当判据，这个残缺库会被
+    永久当成完整，之后任何一次 write_variable 都会在它之上写入数据、再把这个
+    残缺状态用它*自己*的 consolidate 调用标记成「完整」——错误从此再也不会被
+    发现。consolidated 元数据是本项目统一的完成标记（同 write_variable 的
+    「写入顺序：数据 → 溯源 → consolidated 元数据」），故检查它是否存在、以及
+    它记录的成员是否覆盖全部契约坐标与变量，而不是只看目录在不在。
+    """
+    if not path.exists():
+        return False
+    try:
+        g = zarr.open_group(str(path), mode="r")
+    except Exception:
+        return False
+    consolidated = g.metadata.consolidated_metadata
+    if consolidated is None:
+        return False
+    members = set(consolidated.metadata.keys())
+    required = set(_SKELETON_COORDS) | set(VAR_SPECS)
+    return required.issubset(members)
+
+
 def ensure_store(store_dir: Path, month: str) -> Path:
-    """月库不存在则按契约新建（全 NaN 骨架）；已存在则原样返回。
+    """月库骨架不完整（含不存在）则按契约新建/重建（全 NaN 骨架）；已完整则原样返回。
+
+    「重建」用 ``mode="w"`` 整体覆盖——会连带清掉崩溃留下的残缺内容，不会跟旧
+    的部分数组混在一起产出更奇怪的状态。
 
     未写入的 chunk 零内存零磁盘——完整一月骨架实测仅 0.03 MB（逻辑 0.67 GB）。
     """
     path = store_path(store_dir, month)
-    if path.exists():
+    if _skeleton_is_complete(path):
         return path
     times = month_hours(month)
     n = times.size

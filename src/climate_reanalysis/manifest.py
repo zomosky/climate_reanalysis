@@ -12,6 +12,7 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
+import os
 from pathlib import Path
 
 SCHEMA_VERSION = 1
@@ -55,7 +56,9 @@ def write_manifest(
         "completed_at": (completed_at or dt.datetime.now(dt.UTC)).isoformat(),
         "files": [
             {
-                "path": str(f),
+                # 绝对化：manifest 是跨进程产物，restore 可能在别的工作目录读它，
+                # 记相对路径等于记「相对于当时那个 CWD」，换个地方就解析不到
+                "path": str(f.resolve()),
                 "size_bytes": f.stat().st_size,
                 "sha256": _sha256_of(f),
             }
@@ -64,9 +67,17 @@ def write_manifest(
     }
     out = manifest_path(manifest_dir, month, var)
     out.parent.mkdir(parents=True, exist_ok=True)
-    tmp = out.with_suffix(".tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8")
-    tmp.replace(out)          # 原子落地：不会读到写了一半的 manifest
+    # tmp 名带 pid：cron 上一轮没跑完下一轮就起来是常态，确定性的 tmp 名会让
+    # 两个进程打开同一个文件互相截断，交错出损坏的 JSON 再 replace 成正式 manifest。
+    # 后缀仍以 .tmp 收尾，不会被 iter_manifests 的 *.manifest.json 捞到。
+    tmp = out.with_suffix(f".{os.getpid()}.tmp")
+    try:
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=1),
+                       encoding="utf-8")
+        tmp.replace(out)      # 原子落地：不会读到写了一半的 manifest
+    except BaseException:
+        tmp.unlink(missing_ok=True)   # 失败不留半成品
+        raise
     return out
 
 

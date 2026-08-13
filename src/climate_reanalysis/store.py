@@ -140,13 +140,21 @@ def ensure_store(store_dir: Path, month: str) -> Path:
     return path
 
 
+def _normalize_provenance(raw) -> dict:
+    """溯源属性的 str-or-dict 归一：zarr 的 attrs 视后端/序列化路径不同，取
+    出来的嵌套值有时是 JSON 字符串、有时原样是 dict。此前 read_provenance/
+    set_provenance/write_variable 三处各自重复这两行判断，容易三份各自漂移
+    （改一处忘另外两处）——收敛成一份，谁都调这一个。
+    """
+    return json.loads(raw) if isinstance(raw, str) else dict(raw)
+
+
 def read_provenance(store_dir: Path, month: str) -> dict:
     path = store_path(store_dir, month)
     if not path.exists():
         return {}
     g = zarr.open_group(str(path), mode="r")
-    prov = dict(g.attrs).get(_PROV_KEY, {})
-    return json.loads(prov) if isinstance(prov, str) else dict(prov)
+    return _normalize_provenance(dict(g.attrs).get(_PROV_KEY, {}))
 
 
 def has_data(store_dir: Path, month: str, var: str) -> bool:
@@ -169,8 +177,7 @@ def has_data(store_dir: Path, month: str, var: str) -> bool:
 
 def set_provenance(store_dir: Path, month: str, var: str, entry: dict) -> None:
     g = zarr.open_group(str(store_path(store_dir, month)), mode="r+")
-    prov = dict(g.attrs).get(_PROV_KEY, {})
-    prov = json.loads(prov) if isinstance(prov, str) else dict(prov)
+    prov = _normalize_provenance(dict(g.attrs).get(_PROV_KEY, {}))
     prov[var] = entry
     g.attrs[_PROV_KEY] = prov
     zarr.consolidate_metadata(g.store)
@@ -182,7 +189,9 @@ def write_variable(
     """写入单个变量并更新其溯源。其余变量一字不动。
 
     写入顺序：数据 → 溯源 → consolidated 元数据。最后一步是完成标记，故中途
-    崩溃的库不会被误判为完整。
+    崩溃的库不会被误判为完整。溯源这一步复用 ``set_provenance``（而不是自己
+    再读改写一遍 attrs）——三处各自维护同一段 str-or-dict 归一逻辑容易漂移，
+    这里数据先落盘、再调用它，consolidate 仍然是最后发生的事。
     """
     path = ensure_store(store_dir, month)
     g = zarr.open_group(str(path), mode="r+")
@@ -198,8 +207,4 @@ def write_variable(
             attributes={"units": spec.units, "GRIB_stepType": spec.step_type},
         )
     g[var][:] = data.astype("float32", copy=False)
-    prov = dict(g.attrs).get(_PROV_KEY, {})
-    prov = json.loads(prov) if isinstance(prov, str) else dict(prov)
-    prov[var] = provenance
-    g.attrs[_PROV_KEY] = prov
-    zarr.consolidate_metadata(g.store)
+    set_provenance(store_dir, month, var, provenance)

@@ -9,7 +9,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict
 
 
 class Settings(BaseModel):
@@ -29,7 +29,8 @@ class Settings(BaseModel):
     publish_lag_days: int = 5
     #: 请求区域 (N, W, S, E)，与产出网格同框
     area: tuple[float, float, float, float] = (55.0, 70.0, 15.0, 140.0)
-    #: 指定 .cdsapirc；None = ~/.cdsapirc
+    #: 指定 .cdsapirc；None = ~/.cdsapirc。按惯例是 home 下的凭据文件，故与上面三个
+    #: 数据路径不同：不锚定项目根，只做 ~ 展开（多账号轮换时写 ~/.cdsapirc_xxx）
     cdsapirc: Path | None = None
 
 
@@ -50,5 +51,6 @@ def load_settings(path: Path | None = None) -> Settings:
             "raw_dir": _anchor(base, s.raw_dir),
             "manifest_dir": _anchor(base, s.manifest_dir),
             "store_dir": _anchor(base, s.store_dir),
+            "cdsapirc": s.cdsapirc.expanduser() if s.cdsapirc else None,
         }
     )

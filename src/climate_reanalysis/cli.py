@@ -14,7 +14,11 @@ import sys
 from pathlib import Path
 
 from climate_reanalysis.cds import make_client
-from climate_reanalysis.download import cleanup_account_failed_jobs, download_many
+from climate_reanalysis.download import (
+    cleanup_account_failed_jobs,
+    download_many,
+    preview_account_failed_jobs,
+)
 from climate_reanalysis.logging_setup import configure, get_logger
 from climate_reanalysis.migrate import stamp_legacy
 from climate_reanalysis.period import ready_months
@@ -72,13 +76,28 @@ def cmd_migrate(args) -> int:
 
 def cmd_cleanup_jobs(args) -> int:
     """账号级清理：删除该账号上全部失败/被拒 job，不限本批。危险操作——同账号
-    可能正跑着别的下载任务（例如另一段历史回填），会被一并删掉。这是它跟
-    download 收尾自动做的清理（只清本轮）的区别，故独立成一个必须显式调用
-    的子命令，不会被日常 cron 意外碰到。
+    可能正跑着别的下载任务（例如另一段历史回填），敲错账号/配置即刻执行、
+    不可撤销。这是它跟 download 收尾自动做的清理（只清本轮）的区别，故独立
+    成一个必须显式调用的子命令，不会被日常 cron 意外碰到。
+
+    **dry-run 是默认行为**：不加 ``--yes`` 只预览将要删除什么（按状态分类的
+    数量 + 若干示例 id），不做任何实际删除；必须显式加 ``--yes`` 才会真的
+    执行删除。零防呆的账号级删除此前敲错即刻生效，没有任何找回办法。
     """
     s = load_settings(args.config)
     statuses = tuple(args.statuses) if args.statuses else ("failed", "rejected")
-    n = cleanup_account_failed_jobs(make_client(s), statuses)
+    client = make_client(s)
+    if not args.yes:
+        preview = preview_account_failed_jobs(client, statuses)
+        total = 0
+        for status, ids in preview.items():
+            total += len(ids)
+            log.info("cleanup_jobs_preview", status=status, count=len(ids),
+                     sample=ids[:5])
+        log.info("cleanup_jobs_dry_run", total=total,
+                 hint="预览模式，未删除任何 job；加 --yes 才会真正执行")
+        return 0
+    n = cleanup_account_failed_jobs(client, statuses)
     log.info("cleanup_jobs_done", count=n)
     return 0
 
@@ -123,9 +142,13 @@ def main(argv=None) -> int:
 
     cj = sub.add_parser("cleanup-jobs", help=(
         "账号级清理全部失败/被拒 job（危险，不限本批——独立入口，别挂进日常"
-        "下载收尾，同账号可能正跑着别的批次）"
+        "下载收尾，同账号可能正跑着别的批次；默认 dry-run 只预览，加 --yes 才真删）"
     ))
     cj.add_argument("--statuses", nargs="*", help="留空 = failed rejected")
+    cj.add_argument("--yes", action="store_true", help=(
+        "真正执行删除；不加则只预览将要删除什么（数量+按状态分类+示例 id），"
+        "不做任何实际删除——默认行为，账号级清理不可撤销、敲错即刻生效"
+    ))
     cj.set_defaults(func=cmd_cleanup_jobs)
 
     lv = sub.add_parser("list-variables", help="列出产出变量与其 CDS 来源")

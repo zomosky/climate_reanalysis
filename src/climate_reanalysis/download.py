@@ -187,10 +187,23 @@ def cleanup_account_failed_jobs(client, statuses=("failed", "rejected")) -> int:
 
     危险操作——同账号上可能正跑着别的下载任务（例如另一段历史回填），会被
     一并删掉。**不要**在下载收尾时自动调用；只作为显式、独立的运维入口
-    （CLI ``cleanup-jobs`` 子命令），需要时手动触发。
+    （CLI ``cleanup-jobs`` 子命令，默认走 ``preview_account_failed_jobs`` 的
+    dry-run，只有显式加 ``--yes`` 才会调用本函数真正执行），需要时手动触发。
     """
     ids = _list_failed_ids(client, statuses, None)
     _delete_ids(client, ids)
     if ids:
         log.info("cleaned_failed_jobs_account_wide", count=len(ids))
     return len(ids)
+
+
+def preview_account_failed_jobs(
+    client, statuses=("failed", "rejected")
+) -> dict[str, list[str]]:
+    """``cleanup_account_failed_jobs`` 的 dry-run 预览：按状态分类列出**将会**
+    被删除的 job id，不做任何实际删除。账号级清理是不可撤销操作、同账号可能
+    正跑着别人的任务（例如一段 20 年历史回填），敲错账号/敲错配置即刻执行没
+    有任何找回办法——CLI ``cleanup-jobs`` 默认走这个函数，必须显式加 ``--yes``
+    才会转去调用真正执行删除的 ``cleanup_account_failed_jobs``。
+    """
+    return {st: _list_failed_ids(client, [st], None) for st in statuses}

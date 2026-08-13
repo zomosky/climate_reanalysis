@@ -215,6 +215,36 @@ def test_cleanup_account_wide_batches_deletes_in_groups_of_50(monkeypatch):
     assert calls == [50, 50, 20]
 
 
+def test_preview_account_wide_lists_by_status_without_deleting(monkeypatch):
+    """cleanup-jobs CLI 默认走的 dry-run 预览：按状态分类列出将要删除的 id，
+    绝不调用 delete——账号级清理零防呆、敲错即刻不可撤销，预览路径必须从
+    结构上不可能碰到真删。
+
+    ``delete`` 调用记进列表而不是直接 raise：``_delete_ids`` 本身会 try/except
+    吞掉 delete 抛出的异常（清理失败不该影响下载结果），若这里改成 raise，
+    误删也会被那层 except 悄悄咽掉、测不出来——必须靠事后断言列表为空。
+    """
+    from climate_reanalysis.download import preview_account_failed_jobs
+
+    deleted: list[str] = []
+
+    class C:
+        def get_jobs(self, limit, status):
+            from types import SimpleNamespace
+            return SimpleNamespace(request_ids=[f"{status}-1", f"{status}-2"])
+
+        def delete(self, *ids):
+            deleted.extend(ids)
+
+    preview = preview_account_failed_jobs(C())
+
+    assert preview == {
+        "failed": ["failed-1", "failed-2"],
+        "rejected": ["rejected-1", "rejected-2"],
+    }
+    assert deleted == []
+
+
 def test_cleanup_scoped_only_deletes_this_rounds_ids(monkeypatch):
     """cleanup_failed_jobs（download_many 收尾调用的那个）只能删 job_ids 范围内
     的——同账号上可能正跑着别的批次，账号级返回的失败/被拒列表里混着不属于

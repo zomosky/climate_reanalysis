@@ -89,8 +89,8 @@ def test_no_config_flag_falls_back_to_defaults_when_conventional_path_absent(
 
 def test_cleanup_jobs_is_a_separate_explicit_entry_point(tmp_path, monkeypatch):
     """cleanup-jobs 是账号级清理（不限本批）——必须是一个要显式敲出来的独立
-    子命令，且要调用 cleanup_account_failed_jobs 而不是 download_many 收尾
-    那个只清本轮的 cleanup_failed_jobs。"""
+    子命令，且加 --yes 时要调用 cleanup_account_failed_jobs 而不是
+    download_many 收尾那个只清本轮的 cleanup_failed_jobs。"""
     cfg = _settings_yaml(tmp_path)
 
     class FakeClient:
@@ -105,10 +105,58 @@ def test_cleanup_jobs_is_a_separate_explicit_entry_point(tmp_path, monkeypatch):
     monkeypatch.setattr("climate_reanalysis.cli.make_client", lambda s: FakeClient())
     monkeypatch.setattr("climate_reanalysis.cli.cleanup_account_failed_jobs", fake_cleanup)
 
-    rc = cli.main(["--config", str(cfg), "cleanup-jobs"])
+    rc = cli.main(["--config", str(cfg), "cleanup-jobs", "--yes"])
 
     assert rc == 0
     assert captured["statuses"] == ("failed", "rejected")
+
+
+def test_cleanup_jobs_defaults_to_dry_run_and_deletes_nothing(tmp_path, monkeypatch, capsys):
+    """账号级清理零防呆：敲错账号/配置即刻执行、不可撤销（同账号可能正跑着
+    别人的 20 年历史回填）。不加 --yes 必须是纯预览——一次删除都不发生，哪怕
+    账号上确实有一堆失败 job 可删。这里把 cleanup_account_failed_jobs 打成
+    "调用即失败"，从结构上钉死默认路径不可能碰到真删。"""
+    cfg = _settings_yaml(tmp_path)
+
+    class FakeClient:
+        pass
+
+    def _forbid_delete(*_args, **_kwargs):
+        raise AssertionError("dry-run 默认行为不该调用真正执行删除的函数")
+
+    def fake_preview(client, statuses):
+        return {"failed": ["job-1", "job-2"], "rejected": ["job-3"]}
+
+    monkeypatch.setattr("climate_reanalysis.cli.make_client", lambda s: FakeClient())
+    monkeypatch.setattr("climate_reanalysis.cli.cleanup_account_failed_jobs", _forbid_delete)
+    monkeypatch.setattr("climate_reanalysis.cli.preview_account_failed_jobs", fake_preview)
+
+    rc = cli.main(["--config", str(cfg), "cleanup-jobs"])   # 不加 --yes
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "cleanup_jobs_preview" in out
+    assert "cleanup_jobs_dry_run" in out
+
+
+def test_cleanup_jobs_without_yes_never_calls_real_preview_deletion(tmp_path, monkeypatch):
+    """即使不打桩 preview（走真实的 preview_account_failed_jobs 实现），只要
+    没加 --yes，真正执行删除的 cleanup_account_failed_jobs 也绝不能被调用。"""
+    cfg = _settings_yaml(tmp_path)
+
+    class FakeClient:
+        def get_jobs(self, **_kwargs):
+            class _Page:
+                request_ids = ["job-1", "job-2"]
+            return _Page()
+
+    def _forbid_delete(*_args, **_kwargs):
+        raise AssertionError("dry-run 默认行为不该调用真正执行删除的函数")
+
+    monkeypatch.setattr("climate_reanalysis.cli.make_client", lambda s: FakeClient())
+    monkeypatch.setattr("climate_reanalysis.cli.cleanup_account_failed_jobs", _forbid_delete)
+
+    assert cli.main(["--config", str(cfg), "cleanup-jobs"]) == 0
 
 
 def test_download_and_restore_never_call_account_wide_cleanup(tmp_path, monkeypatch):

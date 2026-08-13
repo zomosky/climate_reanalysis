@@ -1,8 +1,10 @@
-"""downloader：就绪判据、请求形态、失败粒度、缓存复用。"""
+"""downloader：就绪判据、请求形态、失败粒度、缓存复用、并发上限。"""
 
 from __future__ import annotations
 
 import datetime as dt
+import threading
+import time
 from pathlib import Path
 
 from climate_reanalysis.download import (
@@ -104,6 +106,22 @@ def test_cached_raw_is_not_redownloaded(monkeypatch, tmp_path: Path):
     assert len(c.requests) == n          # 未重复请求
 
 
+def test_multi_file_variable_partial_failure_writes_no_manifest(monkeypatch, tmp_path: Path):
+    """si10 = u10 + v10：一个成功一个失败——"只在成功时写 manifest"这条唯一契约
+    必须对多文件变量也成立，不能因为已经拿到一半就侥幸写出。"""
+    s = _settings(tmp_path)
+    c = FakeClient(fail_on={"10m_v_component_of_wind"})
+    _fake_retrieve(monkeypatch, c)
+    ok, failed = download_many(s, c, ["202601"], ["si10"], TODAY)
+    assert ok == []
+    assert [f[1] for f in failed] == ["si10"]
+    assert not manifest_path(s.manifest_dir, "202601", "si10").exists()
+    # 已成功那一半（u10）的 raw 文件确实落了盘——但没有 manifest 就不算数，
+    # 下次调用会重新走到 v10 那一步再试一次（u10 因缓存命中不会重下）。
+    assert raw_path(s.raw_dir, "202601", "10m_u_component_of_wind").exists()
+    assert not raw_path(s.raw_dir, "202601", "10m_v_component_of_wind").exists()
+
+
 def test_cleanup_deletes_failed_jobs(monkeypatch, tmp_path: Path):
     """失败 job 占配额直到删除——批次收尾必须清理。"""
     from climate_reanalysis.download import cleanup_failed_jobs
@@ -151,3 +169,75 @@ def test_cleanup_batches_deletes_in_groups_of_50(monkeypatch):
 
     assert cleanup_failed_jobs(C()) == 120
     assert calls == [50, 50, 20]
+
+
+# --------------------------------------------------------------------------- #
+# settings.concurrency：并发的意义不在带宽而在排队重叠——CDS 每个请求排队常要
+# 1-1.5 小时，顺序跑时这段等待完全串行；多个请求同时在飞行，等待期彼此重叠。
+# 不依赖时序断言具体重叠了几次（会 flaky），只钉住"峰值不超过配置上限"这条
+# 硬约束，以及"concurrency=1 时确实退化成顺序"。
+# --------------------------------------------------------------------------- #
+def _peak_tracking_retrieve(monkeypatch, state: dict, lock: threading.Lock,
+                            delay: float = 0.05, fail_on: set[str] | None = None):
+    """打桩 retrieve：记录同时在飞行的调用数峰值，用 sleep 撑开窗口让并发有
+    机会真的重叠（否则 GIL + 瞬时假 I/O 可能巧合地表现成顺序，测试会假阳性）。"""
+    fail_on = fail_on or set()
+
+    def rv(cl, dataset, request, target, proxy, attempts=6):
+        with lock:
+            state["current"] += 1
+            state["peak"] = max(state["peak"], state["current"])
+        time.sleep(delay)
+        with lock:
+            state["current"] -= 1
+        v = request["variable"][0]
+        if v in fail_on:
+            raise RuntimeError(f"CDS job failed: {v}")
+        Path(target).parent.mkdir(parents=True, exist_ok=True)
+        Path(target).write_bytes(b"nc")
+        return Path(target)
+
+    monkeypatch.setattr("climate_reanalysis.download.retrieve", rv)
+
+
+def test_download_many_respects_concurrency_limit(monkeypatch, tmp_path: Path):
+    s = Settings(raw_dir=tmp_path / "raw", manifest_dir=tmp_path / "m",
+                store_dir=tmp_path / "s", dl_proxy=None, concurrency=4)
+    lock = threading.Lock()
+    state = {"current": 0, "peak": 0}
+    _peak_tracking_retrieve(monkeypatch, state, lock)
+    c = FakeClient()
+    variables = ["t2m", "sp", "d2m", "u100", "v100", "si10"]   # 够撑开并发窗口
+    download_many(s, c, ["202601"], variables, TODAY)
+
+    assert state["peak"] <= 4       # 硬约束：绝不超过配置上限
+    assert state["peak"] > 1        # 真的重叠过，不是巧合地退化成顺序
+
+
+def test_download_many_is_sequential_when_concurrency_is_one(monkeypatch, tmp_path: Path):
+    s = Settings(raw_dir=tmp_path / "raw", manifest_dir=tmp_path / "m",
+                store_dir=tmp_path / "s", dl_proxy=None, concurrency=1)
+    lock = threading.Lock()
+    state = {"current": 0, "peak": 0}
+    _peak_tracking_retrieve(monkeypatch, state, lock, delay=0.02)
+    c = FakeClient()
+    download_many(s, c, ["202601"], ["t2m", "sp", "d2m"], TODAY)
+
+    assert state["peak"] == 1       # concurrency=1 不能借并发框架偷偷跑并行
+
+
+def test_concurrent_failure_does_not_affect_others(monkeypatch, tmp_path: Path):
+    """并发路径下失败隔离必须依然成立：一个变量失败不影响同批其它变量。"""
+    s = _settings(tmp_path)   # concurrency 默认 4
+    lock = threading.Lock()
+    state = {"current": 0, "peak": 0}
+    _peak_tracking_retrieve(monkeypatch, state, lock, delay=0.02,
+                            fail_on={"2m_temperature"})
+    c = FakeClient()
+    ok, failed = download_many(s, c, ["202601"], ["t2m", "sp", "d2m", "u100"], TODAY)
+
+    assert sorted(o[1] for o in ok) == ["d2m", "sp", "u100"]
+    assert [f[1] for f in failed] == ["t2m"]
+    assert not manifest_path(s.manifest_dir, "202601", "t2m").exists()
+    for v in ("sp", "d2m", "u100"):
+        assert manifest_path(s.manifest_dir, "202601", v).exists()

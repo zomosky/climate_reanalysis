@@ -36,7 +36,7 @@ def test_stamp_replaces_entry_without_touching_data(tmp_path: Path):
     np.testing.assert_allclose(ds["ssrd"].values, 2.0)            # 数据数组一字未动
 
 
-def test_skips_variables_with_real_manifest_provenance(tmp_path: Path):
+def test_skips_variables_with_real_manifest_provenance(tmp_path: Path, capsys):
     """已有 ``manifest_sha256`` 的条目是这条管线正常下载 + restore 切割过的真实
     数据，不是历史遗留——``stamp_legacy`` 只补缺，不改写已有真实溯源。范围传参一旦
     与已下载月份重叠，无条件覆盖会把 manifest_sha256 换成 legacy 标记；此时若 raw
@@ -51,6 +51,10 @@ def test_skips_variables_with_real_manifest_provenance(tmp_path: Path):
     n = stamp_legacy(tmp_path, ["202601"], ["ssrd"], "legacy:solarcast-bake")
     assert n == 0
     assert read_provenance(tmp_path, "202601")["ssrd"] == real_prov   # 一字未改
+    # 静默跳过等于让操作者以为迁移覆盖到了这个变量——必须出声。
+    # structlog 用 PrintLoggerFactory 写 stdout，caplog 抓不到，得用 capsys。
+    out = capsys.readouterr().out
+    assert "skip_real_provenance" in out and "ssrd" in out
 
 
 def test_fdir_gets_clipped_tag(tmp_path: Path):

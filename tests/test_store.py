@@ -6,6 +6,7 @@ from pathlib import Path
 
 import numpy as np
 import xarray as xr
+import zarr
 
 from climate_reanalysis.store import (
     CHUNK,
@@ -106,3 +107,27 @@ def test_consolidated_metadata_refreshed_after_write(tmp_path: Path):
     write_variable(tmp_path, "202601", "t2m", data, {"manifest_sha256": "x"})
     ds = xr.open_zarr(store_path(tmp_path, "202601"), consolidated=True)
     np.testing.assert_allclose(ds["t2m"].values[0, 0, 0], 7.0)
+
+
+def test_write_variable_consolidates_only_after_data_is_on_disk(tmp_path: Path, monkeypatch):
+    """完整性标志（consolidated 元数据）必须最后写：崩溃在它之前的库不能被误判
+    完整。这里不满足于事后检查最终状态——那测不出顺序错了，只测得出最终结果对了
+    （错误顺序在无崩溃的正常路径下产出的最终文件内容其实是一样的）。真正钉住
+    顺序的办法是在 consolidate 被调用的**那一刻**回头看数据是不是已经在盘上：
+    打桩 zarr.consolidate_metadata，在桩里用一个独立的（非 consolidated）group
+    句柄直接读目标值——如果实现把 consolidate 挪到写数据之前，这个瞬间读到的
+    还是 NaN 骨架值，断言就会失败。"""
+    ensure_store(tmp_path, "202601")
+    data = np.full((31 * 24, 161, 281), 9.0, dtype="float32")
+    seen: dict = {}
+    real_consolidate = zarr.consolidate_metadata
+
+    def spy(store, *a, **kw):
+        g = zarr.open_group(str(store_path(tmp_path, "202601")), mode="r")
+        seen["value_at_consolidate_time"] = float(g["t2m"][0, 0, 0])
+        return real_consolidate(store, *a, **kw)
+
+    monkeypatch.setattr(zarr, "consolidate_metadata", spy)
+    write_variable(tmp_path, "202601", "t2m", data, {"manifest_sha256": "x"})
+
+    assert seen["value_at_consolidate_time"] == 9.0

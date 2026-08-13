@@ -106,6 +106,27 @@ def test_cached_raw_is_not_redownloaded(monkeypatch, tmp_path: Path):
     assert len(c.requests) == n          # 未重复请求
 
 
+def test_existing_manifest_short_circuits_even_when_raw_was_cleaned_up(
+    monkeypatch, tmp_path: Path
+):
+    """「manifest 存在即早退」是保护 CDS 配额的闸门：raw 在 restore 成功后按
+    README 建议会被清理，此时唯一还在的信号是 manifest。若这条早退失效，
+    download_one 会退到逐 cds_var 检查 raw 是否存在——raw 已删、必然不存在——
+    从而对已经处理过的 (月×变量) 重新发起一次真实 CDS 请求，等于每次 cron
+    都重下已有数据。这条用例必须只靠 manifest 存在就短路，不依赖 raw 是否还在。"""
+    s = _settings(tmp_path)
+    c = FakeClient()
+    _fake_retrieve(monkeypatch, c)
+    download_one(s, c, "202601", "t2m", TODAY)
+    assert len(c.requests) == 1
+    raw_path(s.raw_dir, "202601", "2m_temperature").unlink()   # 模拟 restore 后清理 raw
+
+    p = download_one(s, c, "202601", "t2m", TODAY)
+
+    assert p == manifest_path(s.manifest_dir, "202601", "t2m")
+    assert len(c.requests) == 1        # 没有发起第二次真实请求
+
+
 def test_multi_file_variable_partial_failure_writes_no_manifest(monkeypatch, tmp_path: Path):
     """si10 = u10 + v10：一个成功一个失败——"只在成功时写 manifest"这条唯一契约
     必须对多文件变量也成立，不能因为已经拿到一半就侥幸写出。"""

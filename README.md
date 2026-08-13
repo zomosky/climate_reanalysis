@@ -105,12 +105,15 @@ uv run climate_reanalysis restore
 项目留下的失败 job），用独立的子命令，需要显式敲出来：
 
 ```bash
-uv run climate_reanalysis cleanup-jobs
-uv run climate_reanalysis cleanup-jobs --statuses failed   # 只清 failed，不动 rejected
+uv run climate_reanalysis cleanup-jobs                    # 默认 dry-run：只预览，不删
+uv run climate_reanalysis cleanup-jobs --statuses failed  # 预览时只看 failed，不看 rejected
+uv run climate_reanalysis cleanup-jobs --yes              # 确认预览无误后，加 --yes 才真删
 ```
 
 **这条命令不会被 `download`/`restore` 自动调用**——它是危险操作，误删同账号上别人
-正跑着的任务没有撤销的余地，只应该在确认清楚账号上都是自己的任务时手动执行。
+正跑着的任务没有撤销的余地，只应该在确认清楚账号上都是自己的任务时手动执行。**不加
+`--yes` 是默认行为、且不做任何实际删除**：只按状态分类打印将要删除的数量与若干示例
+id，供人工核对账号/统计对不对；确认无误后再加 `--yes` 重跑一次才会真正执行删除。
 
 ## 历史迁移（一次性）
 
@@ -213,6 +216,18 @@ manifest 的 sha 与月库溯源不一致时才需要读 raw，一致就跳过�
 
 这条路径本项目**不打算做成自动化**——「月库损坏」本身应当是罕见情况，自动删 manifest
 去触发重下有误删的风险（比如把一次误报当成真损坏），不如留给人工确认后手动处理。
+
+**「raw 缺失」与「月库本身物理损坏打不开」是两种不同的坏法，恢复方式不同**：上面
+四步流程针对的是前者（月库结构完好，只是某个 (月×变量) 的溯源对不上、需要 raw 重建）。
+如果是后者——月库的 `.zarr` 本身打不开（磁盘问题、`zarr.json` 截断/写坏等）——
+`ensure_store`/`write_variable` 会抛 `StoreCorruptedError` 点名月份和路径，同样让
+`restore` 报错退出非 0，**但绝不会自动删除或重建这个库**（这是刻意的：库里可能还有
+其它变量的真实数据幸存，自动重建会把它们一并静默清空）。这种情况仅删 manifest 重跑
+`download`/`restore` 不够——损坏的是月库文件本身，需要人工确认后手动删除/搬走这个
+`<YYYYMM>_era5.zarr` 目录，再按上面的步骤重新走一遍。另有一种中间状态：库能打开但
+骨架不完整（建到一半崩溃）——若确认是空壳（无真实数据无溯源）会自动安全重建并打
+`rebuilding_empty_skeleton` 日志；若已经写入过真实数据/溯源则同样拒绝重建，抛
+`IncompleteStoreHasDataError`，需要人工核实后再决定重建还是修复。
 
 ## 目录结构
 

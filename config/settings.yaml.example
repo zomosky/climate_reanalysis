@@ -1,0 +1,14 @@
+# 复制为 config/settings.yaml 后按机器修改（真实文件不入版本库）
+raw_dir: data/raw
+manifest_dir: data/manifests
+store_dir: /Volumes/TUF/climate/era5/monthly
+
+# bulk download 走的代理；留空 = 裸连。submit/poll 一律直连。
+# 本机 Clash 实测 4.8 MB/s，服务器无代理裸连仅 10.6 KB/s。
+dl_proxy: http://127.0.0.1:7890
+
+# 链路退化时（日志频现 curl rc=18）调低到 1-2
+concurrency: 4
+
+# ERA5 发布延迟：月末再等这么多天才认为该月齐全
+publish_lag_days: 5

@@ -14,7 +14,7 @@ import sys
 from pathlib import Path
 
 from climate_reanalysis.cds import make_client
-from climate_reanalysis.download import download_many
+from climate_reanalysis.download import cleanup_account_failed_jobs, download_many
 from climate_reanalysis.logging_setup import configure, get_logger
 from climate_reanalysis.migrate import stamp_legacy
 from climate_reanalysis.period import ready_months
@@ -52,6 +52,19 @@ def cmd_migrate(args) -> int:
     return 0
 
 
+def cmd_cleanup_jobs(args) -> int:
+    """账号级清理：删除该账号上全部失败/被拒 job，不限本批。危险操作——同账号
+    可能正跑着别的下载任务（例如另一段历史回填），会被一并删掉。这是它跟
+    download 收尾自动做的清理（只清本轮）的区别，故独立成一个必须显式调用
+    的子命令，不会被日常 cron 意外碰到。
+    """
+    s = load_settings(args.config)
+    statuses = tuple(args.statuses) if args.statuses else ("failed", "rejected")
+    n = cleanup_account_failed_jobs(make_client(s), statuses)
+    log.info("cleanup_jobs_done", count=n)
+    return 0
+
+
 def cmd_list_variables(args) -> int:
     for name, spec in VAR_SPECS.items():
         print(f"{name:7s} {spec.units:10s} {spec.step_type:8s} <- {', '.join(spec.cds)}")
@@ -84,6 +97,13 @@ def main(argv=None) -> int:
     m.add_argument("--variables", nargs="+", required=True)
     m.add_argument("--tag", default="legacy:solarcast-bake")
     m.set_defaults(func=cmd_migrate)
+
+    cj = sub.add_parser("cleanup-jobs", help=(
+        "账号级清理全部失败/被拒 job（危险，不限本批——独立入口，别挂进日常"
+        "下载收尾，同账号可能正跑着别的批次）"
+    ))
+    cj.add_argument("--statuses", nargs="*", help="留空 = failed rejected")
+    cj.set_defaults(func=cmd_cleanup_jobs)
 
     lv = sub.add_parser("list-variables", help="列出产出变量与其 CDS 来源")
     lv.set_defaults(func=cmd_list_variables)

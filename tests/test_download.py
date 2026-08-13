@@ -33,9 +33,11 @@ class FakeClient:
 
 
 def _fake_retrieve(monkeypatch, client: FakeClient):
-    def rv(cl, dataset, request, target, proxy, attempts=6):
+    def rv(cl, dataset, request, target, proxy, attempts=6, job_ids=None):
         cl.requests.append((dataset, request))
         v = request["variable"][0]
+        if job_ids is not None:
+            job_ids.append(f"job-{v}")
         if v in cl.fail_on:
             raise RuntimeError(f"CDS job failed: {v}")
         Path(target).parent.mkdir(parents=True, exist_ok=True)
@@ -143,9 +145,11 @@ def test_multi_file_variable_partial_failure_writes_no_manifest(monkeypatch, tmp
     assert not raw_path(s.raw_dir, "202601", "10m_v_component_of_wind").exists()
 
 
-def test_cleanup_deletes_failed_jobs(monkeypatch, tmp_path: Path):
-    """失败 job 占配额直到删除——批次收尾必须清理。"""
-    from climate_reanalysis.download import cleanup_failed_jobs
+def test_cleanup_account_wide_deletes_all_failed_jobs(monkeypatch, tmp_path: Path):
+    """账号级清理（显式独立入口，不由 download_many 自动调用）：失败 job 占配额
+    直到删除，且不限本批——这是它跟 cleanup_failed_jobs 的区别，见下方
+    test_cleanup_scoped_only_deletes_this_rounds_ids。"""
+    from climate_reanalysis.download import cleanup_account_failed_jobs
 
     deleted: list[str] = []
 
@@ -157,24 +161,24 @@ def test_cleanup_deletes_failed_jobs(monkeypatch, tmp_path: Path):
         def delete(self, *ids):
             deleted.extend(ids)
 
-    assert cleanup_failed_jobs(C()) == 4
+    assert cleanup_account_failed_jobs(C()) == 4
     assert set(deleted) == {"failed-1", "failed-2", "rejected-1", "rejected-2"}
 
 
-def test_cleanup_survives_api_errors(monkeypatch):
+def test_cleanup_account_wide_survives_api_errors(monkeypatch):
     """清理失败不得影响下载结果。"""
-    from climate_reanalysis.download import cleanup_failed_jobs
+    from climate_reanalysis.download import cleanup_account_failed_jobs
 
     class C:
         def get_jobs(self, limit, status):
             raise RuntimeError("422")
 
-    assert cleanup_failed_jobs(C()) == 0
+    assert cleanup_account_failed_jobs(C()) == 0
 
 
-def test_cleanup_batches_deletes_in_groups_of_50(monkeypatch):
+def test_cleanup_account_wide_batches_deletes_in_groups_of_50(monkeypatch):
     """267 个失败 job 一次性清过——分页大小必须真的按 50 分批，不能一把梭。"""
-    from climate_reanalysis.download import cleanup_failed_jobs
+    from climate_reanalysis.download import cleanup_account_failed_jobs
 
     calls: list[int] = []
 
@@ -188,8 +192,47 @@ def test_cleanup_batches_deletes_in_groups_of_50(monkeypatch):
             assert len(ids) <= 50
             calls.append(len(ids))
 
-    assert cleanup_failed_jobs(C()) == 120
+    assert cleanup_account_failed_jobs(C()) == 120
     assert calls == [50, 50, 20]
+
+
+def test_cleanup_scoped_only_deletes_this_rounds_ids(monkeypatch):
+    """cleanup_failed_jobs（download_many 收尾调用的那个）只能删 job_ids 范围内
+    的——同账号上可能正跑着别的批次，账号级返回的失败/被拒列表里混着不属于
+    本轮的 id，必须被过滤掉，不能一并删除。"""
+    from climate_reanalysis.download import cleanup_failed_jobs
+
+    deleted: list[str] = []
+
+    class C:
+        def get_jobs(self, limit, status):
+            from types import SimpleNamespace
+            # 服务器上同时有本轮（-mine）和别的批次（-other）留下的失败/被拒 job
+            return SimpleNamespace(request_ids=[f"{status}-mine", f"{status}-other"])
+
+        def delete(self, *ids):
+            deleted.extend(ids)
+
+    n = cleanup_failed_jobs(C(), job_ids=["failed-mine", "rejected-mine"])
+
+    assert n == 2
+    assert set(deleted) == {"failed-mine", "rejected-mine"}   # "-other" 一个都没碰
+
+
+def test_cleanup_scoped_with_no_submissions_is_a_noop(monkeypatch):
+    """本轮全部缓存命中、一个都没下（job_ids 为空）——收尾照样调用一次，但
+    天然清不出任何东西，不需要特判成"跳过"。"""
+    from climate_reanalysis.download import cleanup_failed_jobs
+
+    class C:
+        def get_jobs(self, limit, status):
+            from types import SimpleNamespace
+            return SimpleNamespace(request_ids=[f"{status}-someone-elses"])
+
+        def delete(self, *ids):
+            raise AssertionError("job_ids 为空时不该删任何东西")
+
+    assert cleanup_failed_jobs(C(), job_ids=[]) == 0
 
 
 # --------------------------------------------------------------------------- #
@@ -204,7 +247,7 @@ def _peak_tracking_retrieve(monkeypatch, state: dict, lock: threading.Lock,
     机会真的重叠（否则 GIL + 瞬时假 I/O 可能巧合地表现成顺序，测试会假阳性）。"""
     fail_on = fail_on or set()
 
-    def rv(cl, dataset, request, target, proxy, attempts=6):
+    def rv(cl, dataset, request, target, proxy, attempts=6, job_ids=None):
         with lock:
             state["current"] += 1
             state["peak"] = max(state["peak"], state["current"])
@@ -212,6 +255,8 @@ def _peak_tracking_retrieve(monkeypatch, state: dict, lock: threading.Lock,
         with lock:
             state["current"] -= 1
         v = request["variable"][0]
+        if job_ids is not None:
+            job_ids.append(f"job-{v}")
         if v in fail_on:
             raise RuntimeError(f"CDS job failed: {v}")
         Path(target).parent.mkdir(parents=True, exist_ok=True)

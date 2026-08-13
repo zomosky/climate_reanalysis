@@ -452,3 +452,35 @@ def test_retrieve_raises_after_exhausting_download_attempts(monkeypatch, tmp_pat
     with pytest.raises(RuntimeError, match="下载失败"):
         cds.retrieve(FakeClient(), "ds", {"variable": ["t2m"]},
                      tmp_path / "x.nc", proxy=None, attempts=2)
+
+
+def test_retrieve_records_submitted_job_id_when_tracked(monkeypatch, tmp_path: Path):
+    """job_ids 提供时，submit 成功后立即记下 request_id——不等最终成功/失败。
+    这是 download.cleanup_failed_jobs 只清理本轮任务的依据：账号级全清会误伤
+    同账号上跑着的别的任务，必须能分辨"这个 job 是不是本轮提交的"。"""
+    import climate_reanalysis.cds as cds
+
+    monkeypatch.setattr(cds.time, "sleep", lambda s: None)
+
+    class FakeRemote:
+        request_id = "req-42"
+
+        @property
+        def status(self):
+            return "successful"
+
+        def get_results(self):
+            return SimpleNamespace(asset={"href": "https://obj/x.zip"})
+
+    class FakeClient:
+        def submit(self, dataset, request):
+            return FakeRemote()
+
+    monkeypatch.setattr(cds, "curl_download",
+                        lambda url, target, proxy, attempts=8: Path(target).write_bytes(b"ok"))
+
+    ids: list[str] = []
+    cds.retrieve(FakeClient(), "ds", {"variable": ["t2m"]}, tmp_path / "x.nc",
+                proxy=None, job_ids=ids)
+
+    assert ids == ["req-42"]

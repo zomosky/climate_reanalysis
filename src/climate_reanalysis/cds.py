@@ -152,9 +152,18 @@ def curl_download(url: str, target: Path, proxy: str | None,
 
 
 def retrieve(client, dataset: str, request: dict, target: Path,
-             proxy: str | None, attempts: int = 6) -> Path:
-    """submit → poll → 下载。每次重试都重新取 URL（预签名会过期）。"""
+             proxy: str | None, attempts: int = 6,
+             job_ids: list[str] | None = None) -> Path:
+    """submit → poll → 下载。每次重试都重新取 URL（预签名会过期）。
+
+    ``job_ids``：submit 成功后立即把 ``remote.request_id`` 追加进这个调用方
+    提供的列表——不论这次 submit 最终成功还是失败，都要记下来，好让批次
+    收尾时"只清理本轮自己提交的失败 job"（见 download.cleanup_failed_jobs）
+    有据可查，而不必对账号做一次全量扫描。
+    """
     remote = client.submit(dataset, request)
+    if job_ids is not None:
+        job_ids.append(remote.request_id)
     while True:
         st = remote.status
         if st == "successful":

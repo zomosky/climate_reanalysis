@@ -68,6 +68,42 @@ def test_download_requires_explicit_start(tmp_path, monkeypatch):
         cli.main(["--config", str(cfg), "download"])
 
 
+def test_cleanup_jobs_is_a_separate_explicit_entry_point(tmp_path, monkeypatch):
+    """cleanup-jobs 是账号级清理（不限本批）——必须是一个要显式敲出来的独立
+    子命令，且要调用 cleanup_account_failed_jobs 而不是 download_many 收尾
+    那个只清本轮的 cleanup_failed_jobs。"""
+    cfg = _settings_yaml(tmp_path)
+
+    class FakeClient:
+        pass
+
+    captured = {}
+
+    def fake_cleanup(client, statuses):
+        captured["statuses"] = statuses
+        return 3
+
+    monkeypatch.setattr("climate_reanalysis.cli.make_client", lambda s: FakeClient())
+    monkeypatch.setattr("climate_reanalysis.cli.cleanup_account_failed_jobs", fake_cleanup)
+
+    rc = cli.main(["--config", str(cfg), "cleanup-jobs"])
+
+    assert rc == 0
+    assert captured["statuses"] == ("failed", "rejected")
+
+
+def test_download_and_restore_never_call_account_wide_cleanup(tmp_path, monkeypatch):
+    """download/restore 收尾都不该碰账号级清理——那是 cleanup-jobs 独有的、
+    需要显式调用的危险操作。"""
+    cfg = _settings_yaml(tmp_path)
+    monkeypatch.setattr("climate_reanalysis.cli.cleanup_account_failed_jobs", _forbid_network)
+
+    assert cli.main(["--config", str(cfg), "restore"]) == 0
+    # download：起始月份远在未来，未就绪、不联网，同样不该碰账号级清理
+    assert cli.main(["--config", str(cfg), "download", "--start", "209901",
+                     "--today", "2026-08-13"]) == 0
+
+
 def test_restore_on_empty_manifest_dir_is_a_noop(tmp_path):
     cfg = _settings_yaml(tmp_path)
     assert cli.main(["--config", str(cfg), "restore"]) == 0

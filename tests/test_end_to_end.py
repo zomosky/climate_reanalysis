@@ -27,7 +27,7 @@ def test_two_months_three_variables_roundtrip(monkeypatch, tmp_path: Path):
     values = {"surface_solar_radiation_downwards": 7200.0,
               "2m_temperature": 285.0, "surface_pressure": 101325.0}
 
-    def rv(cl, dataset, request, target, proxy, attempts=6):
+    def rv(cl, dataset, request, target, proxy, attempts=6, job_ids=None):
         v = request["variable"][0]
         month = f"{request['year'][0]}{request['month'][0]}"
         make_raw_nc(Path(target), month, v, values[v])

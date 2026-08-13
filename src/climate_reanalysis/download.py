@@ -51,8 +51,13 @@ def build_request(cds_var: str, month: str, area) -> dict:
 
 
 def download_one(settings, client, month: str, var: str,
-                 today: dt.date | None = None) -> Path | None:
-    """下载一个（月×产出变量）。未就绪返回 None；成功返回 manifest 路径。"""
+                 today: dt.date | None = None,
+                 job_ids: list[str] | None = None) -> Path | None:
+    """下载一个（月×产出变量）。未就绪返回 None；成功返回 manifest 路径。
+
+    ``job_ids``：透传给 ``retrieve``，用来记录本轮提交的 CDS request_id
+    （见 ``cleanup_failed_jobs`` 为什么只清理本轮自己的任务）。
+    """
     today = today or dt.date.today()
     if not is_ready(month, today, settings.publish_lag_days):
         log.info("skip_not_ready", month=month, var=var)
@@ -65,20 +70,22 @@ def download_one(settings, client, month: str, var: str,
         target = raw_path(settings.raw_dir, month, cds_var)
         if not target.exists():          # 缓存命中则不重复请求
             retrieve(client, DATASET, build_request(cds_var, month, settings.area),
-                     target, settings.dl_proxy)
+                     target, settings.dl_proxy, job_ids=job_ids)
         files.append(target)
     return write_manifest(settings.manifest_dir, month, var, files, settings.area)
 
 
 def _download_one_result(settings, client, month: str, var: str,
-                         today: dt.date | None):
+                         today: dt.date | None, job_ids: list[str]):
     """并发 worker：把 download_one 的结果/异常规整成一个三元组返回。
 
     worker 线程只产出结果，不直接碰共享的 ok/failed 列表——归并放在主线程的
-    as_completed 循环里做单写者，天然不需要加锁。
+    as_completed 循环里做单写者，天然不需要加锁。``job_ids`` 是个例外：多个
+    worker 会并发 append 同一个列表，但 list.append 在 CPython 里是单条原子
+    字节码，GIL 下天然不会产生撕裂状态，不需要额外加锁。
     """
     try:
-        path = download_one(settings, client, month, var, today)
+        path = download_one(settings, client, month, var, today, job_ids=job_ids)
     except Exception as exc:  # noqa: BLE001 - 单个失败不中断整批，交回主线程记录
         log.error("download_failed", month=month, var=var, error=str(exc))
         return "failed", month, var, str(exc)
@@ -98,14 +105,20 @@ def download_many(settings, client, months: list[str], variables: list[str],
 
     cleanup_failed_jobs 在 ThreadPoolExecutor 的 ``with`` 块退出（等价于全部
     worker 已经 join）之后才调用一次——每个 worker 各清一次既浪费又可能相互
-    踩踏同一批 job id。
+    踩踏同一批 job id。**只清理本轮 submit 得到的 job_ids**——同账号上可能正
+    跑着别的批次（例如另一段历史回填），账号级全清是个危险操作，见
+    ``cleanup_account_failed_jobs`` 的显式独立入口。即使本轮全部缓存命中、
+    一个都没下（job_ids 为空），也照样调用一次——只是没有 id 可清，天然是
+    个空操作，不需要特判。
     """
     ok: list[tuple[str, str]] = []
     failed: list[tuple[str, str, str]] = []
+    job_ids: list[str] = []
     tasks = [(month, var) for month in months for var in variables]
     workers = max(1, settings.concurrency)
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = [pool.submit(_download_one_result, settings, client, month, var, today)
+        futures = [pool.submit(_download_one_result, settings, client, month, var,
+                               today, job_ids)
                   for month, var in tasks]
         for fut in as_completed(futures):
             kind, month, var, payload = fut.result()
@@ -114,12 +127,13 @@ def download_many(settings, client, months: list[str], variables: list[str],
             elif kind == "failed":
                 failed.append((month, var, payload))
             # kind == "skip"：未就绪，既不算成功也不算失败
-    cleanup_failed_jobs(client)
+    cleanup_failed_jobs(client, job_ids)
     return ok, failed
 
 
-def cleanup_failed_jobs(client, statuses=("failed", "rejected")) -> int:
-    """删除 CDS 上的失败/被拒 job，释放排队配额。
+def _list_failed_ids(client, statuses, scope: set[str] | None) -> list[str]:
+    """列出 CDS 上处于 ``statuses`` 的 job id；``scope`` 非空时只保留其中的
+    id（『本轮』语义的交集）；``scope=None`` 是账号级——不做任何过滤。
 
     两个 API 细节：``status`` 传 list 会被序列化成空值而 422，必须逐个传；
     ``page.next`` 生成的下一页 URL 会丢掉 status 值、且异常延迟到下一轮访问
@@ -128,14 +142,48 @@ def cleanup_failed_jobs(client, statuses=("failed", "rejected")) -> int:
     ids: list[str] = []
     for st in statuses:
         try:
-            ids.extend(list(client.get_jobs(limit=2000, status=st).request_ids))
+            found = list(client.get_jobs(limit=2000, status=st).request_ids)
         except Exception as exc:  # noqa: BLE001 - 清理失败不影响下载结果
             log.warning("job_list_failed", status=st, error=str(exc))
+            continue
+        if scope is not None:
+            found = [i for i in found if i in scope]
+        ids.extend(found)
+    return ids
+
+
+def _delete_ids(client, ids: list[str]) -> None:
     for i in range(0, len(ids), 50):
         try:
             client.delete(*ids[i:i + 50])
         except Exception as exc:  # noqa: BLE001
             log.warning("job_delete_failed", error=str(exc))
+
+
+def cleanup_failed_jobs(client, job_ids: list[str], statuses=("failed", "rejected")) -> int:
+    """只删除**本轮自己提交**的失败/被拒 job（``job_ids``：本轮 submit 得到的
+    全部 request_id），释放排队配额。
+
+    同账号上可能正跑着别的下载任务（例如另一段历史回填）——不限本批的账号级
+    全清是个危险操作，见 ``cleanup_account_failed_jobs``；``download_many`` 的
+    收尾只应该调用这个作用域受限的版本。
+    """
+    ids = _list_failed_ids(client, statuses, set(job_ids))
+    _delete_ids(client, ids)
     if ids:
         log.info("cleaned_failed_jobs", count=len(ids))
+    return len(ids)
+
+
+def cleanup_account_failed_jobs(client, statuses=("failed", "rejected")) -> int:
+    """账号级清理：删除该账号上**全部**失败/被拒 job，不限本批。
+
+    危险操作——同账号上可能正跑着别的下载任务（例如另一段历史回填），会被
+    一并删掉。**不要**在下载收尾时自动调用；只作为显式、独立的运维入口
+    （CLI ``cleanup-jobs`` 子命令），需要时手动触发。
+    """
+    ids = _list_failed_ids(client, statuses, None)
+    _delete_ids(client, ids)
+    if ids:
+        log.info("cleaned_failed_jobs_account_wide", count=len(ids))
     return len(ids)

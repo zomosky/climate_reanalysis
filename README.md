@@ -72,7 +72,7 @@ uv run climate_reanalysis list-variables
 # 下载：从 --start 起，按 publish_lag_days 判定的「已齐全」月份全部下载
 # （--months 可显式指定月份列表，跳过 ready_months 的自动枚举）
 uv run climate_reanalysis download --start 202501
-uv run climate_reanalysis download --months 202501 --variables ssrdc
+uv run climate_reanalysis download --start 202501 --months 202501 --variables ssrdc
 
 # restore：幂等一趟扫描，只重建溯源不一致/缺失的（月×变量），其余跳过
 uv run climate_reanalysis restore
@@ -80,6 +80,10 @@ uv run climate_reanalysis restore
 
 `--config` 是顶层参数，写在子命令**之前**：`climate_reanalysis --config path/to/settings.yaml download ...`；
 不传则用相对 CWD 的 `config/settings.yaml`。
+
+`--start` **必填、没有默认值**（哪怕搭配 `--months` 显式指定月份也要传，argparse 不看
+业务逻辑）——这是有意的：见下方「历史迁移」一节末尾的说明，一个"看起来无害"的默认值
+会在配合 `migrate` 使用时把整段历史重新引向真实网络请求。
 
 `download` 未就绪时不联网、不报错，直接跳过并返回退出码 0（同月其它变量互不影响）；
 `restore` 全部成功退出码 0，有已就绪的 manifest 处理失败则非 0（同 `climate_restorage`
@@ -113,8 +117,18 @@ uv run climate_reanalysis migrate \
 `legacy:solarcast-bake(clipped)` 标记，使这份差异在数据里可见、将来可选择重下
 （其余变量不受影响）。
 
-月库不存在时该月直接跳过（不会凭空建出一个只有标记、没有数据的库）；对不存在的月份
-迁移是安全的空操作。
+月库不存在时该月直接跳过（不会凭空建出一个只有标记、没有数据的库）；已经有真实
+`manifest_sha256` 溯源的（月×变量）——即已经被这条管线正常下载 + restore 切割过
+的——会被跳过并告警，不会覆盖：`migrate` 只补缺，不改写已有真实数据（范围传参很容易
+跟已下载月份重叠，无条件覆盖会让"这份数据是怎么来的"这条线索消失且不报错）。对不存在
+的月份、已有真实溯源的变量，`migrate` 都是安全的空操作。
+
+**`migrate` 与 `download` 的判据互不相通，别指望一个知道另一个做了什么**：`migrate`
+只看月库里的 `zrread_provenance`，`download`（经 manifest 文件）只看 `manifest_dir`
+里有没有对应的 manifest。给一个月打了 legacy 标记**不会**在 `manifest_dir` 里留下
+任何东西——所以 `download` 的 `--start`/`--months` 覆盖的范围**不要包含已经迁移过的
+历史月份**，否则会把它们当成"从未下载"重新发起真实请求（这正是 `--start` 改成必填、
+不给默认值的原因）。
 
 ## 挂定时任务
 
@@ -125,10 +139,12 @@ uv run climate_reanalysis migrate \
 ```
 
 `download` 同样幂等（manifest 已存在的（月×变量）会跳过重复请求），但耗时长（排队常
-1–1.5 小时/请求），不建议塞进高频 cron；按月手动跑或用较宽松的周期（如每天一次）：
+1–1.5 小时/请求），不建议塞进高频 cron；按月手动跑或用较宽松的周期（如每天一次）。
+**`--start` 必须显式给一个在已迁移历史范围之后的月份**（例如迁移覆盖到 202412，这里
+就从 202501 起）——留空会报错，但传错了同样会把整段历史重新排队：
 
 ```cron
-0 3 * * * cd /path/to/climate_reanalysis && uv run climate_reanalysis download >> /var/log/climate_reanalysis_download.log 2>&1
+0 3 * * * cd /path/to/climate_reanalysis && uv run climate_reanalysis download --start 202501 >> /var/log/climate_reanalysis_download.log 2>&1
 ```
 
 本机长跑请用 `launchd` 而非会话级看护进程——`caffeinate -ims` 只挡空闲休眠，挡不住

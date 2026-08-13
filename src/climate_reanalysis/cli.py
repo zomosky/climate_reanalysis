@@ -65,7 +65,12 @@ def main(argv=None) -> int:
     sub = p.add_subparsers(dest="cmd", required=True)
 
     d = sub.add_parser("download", help="按（月×产出变量）下载并写 manifest")
-    d.add_argument("--start", default="200501", help="起始月份 YYYYMM")
+    d.add_argument("--start", required=True, help=(
+        "起始月份 YYYYMM，必填——没有默认值是有意的：migrate 只写月库溯源、不产生 "
+        "manifest，download 的跳过判据只看 manifest 在不在，两者互不知情。一个"
+        "看起来无害的默认值（例如 200501）会让裸跑一次 download 把已迁移的历史"
+        "月份当成'从未下载'重新发起真实 CDS 请求"
+    ))
     d.add_argument("--months", nargs="*", help="显式指定月份；留空 = 起始到最后一个已齐全月")
     d.add_argument("--variables", nargs="*", help="留空 = 全部产出变量")
     d.add_argument("--today", help="覆盖“今天”（YYYY-MM-DD），用于测试就绪判据")

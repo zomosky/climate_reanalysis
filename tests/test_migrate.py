@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
+import pytest
 import xarray as xr
 
 from climate_reanalysis.migrate import stamp_legacy
@@ -60,6 +61,8 @@ def test_skips_variables_with_real_manifest_provenance(tmp_path: Path, capsys):
 def test_fdir_gets_clipped_tag(tmp_path: Path):
     """历史 fdir 经过 min(fdir,ghi) 截断，与原生值严格讲不同源——须可见。"""
     ensure_store(tmp_path, "202601")
+    data = np.full((31 * 24, 161, 281), 1.5, dtype="float32")
+    write_variable(tmp_path, "202601", "fdir", data, {})   # 真实 legacy 库有数据，不是骨架 NaN
     stamp_legacy(tmp_path, ["202601"], ["fdir"], "legacy:solarcast-bake")
     assert read_provenance(tmp_path, "202601")["fdir"]["source"] == (
         "legacy:solarcast-bake(clipped)"
@@ -68,3 +71,26 @@ def test_fdir_gets_clipped_tag(tmp_path: Path):
 
 def test_skips_missing_month(tmp_path: Path):
     assert stamp_legacy(tmp_path, ["209901"], ["ssrd"], "legacy:x") == 0
+
+
+def test_rejects_unknown_variable_name(tmp_path: Path):
+    """拼错的变量名此前会静默通过——不在任何月库里报错，只是安安静静地
+    什么都没打上（zrread_provenance 不会因为查一个不存在的 key 而报错）。
+    必须在动手之前就拒绝，点名到底是哪个名字不对。"""
+    ensure_store(tmp_path, "202601")
+    with pytest.raises(ValueError, match="ssrf"):
+        stamp_legacy(tmp_path, ["202601"], ["ssrf"], "legacy:x")   # ssrd 拼错
+
+
+def test_skips_variable_with_no_actual_data(tmp_path: Path, capsys):
+    """真实 legacy 库实测：ssrdc 是全 NaN，从没真正落过数据。打上 legacy 标记
+    会让 restore 认为它已经就位，此后永远不会被真正下载补上——必须跳过并
+    出声，而不是照常打标。"""
+    ensure_store(tmp_path, "202601")   # 骨架：ssrdc 全 NaN，从未写入真实数据
+
+    n = stamp_legacy(tmp_path, ["202601"], ["ssrdc"], "legacy:solarcast-bake")
+
+    assert n == 0
+    assert "ssrdc" not in read_provenance(tmp_path, "202601")
+    out = capsys.readouterr().out
+    assert "skip_no_data" in out and "ssrdc" in out

@@ -14,6 +14,7 @@ from climate_reanalysis.store import (
     TARGET_LAT,
     TARGET_LON,
     ensure_store,
+    has_data,
     read_provenance,
     set_provenance,
     store_path,
@@ -72,6 +73,27 @@ def test_ensure_store_rebuilds_a_skeleton_left_incomplete_by_a_crash(tmp_path: P
     }
     assert ds.sizes == {"time": 31 * 24, "latitude": 161, "longitude": 281}
     assert np.isnan(ds["t2m"].values).all()   # 重建后是全 NaN 骨架，不是残缺数组里的垃圾值
+
+
+def test_has_data_distinguishes_all_nan_from_real_values(tmp_path: Path):
+    """真实 legacy 库里 ssrdc 这种"数组被写过但全是 NaN"的情形，has_data 必须
+    能识别——不能只看数组存不存在。"""
+    ensure_store(tmp_path, "202601")
+    assert has_data(tmp_path, "202601", "ssrdc") is False   # 骨架：全 NaN
+
+    all_nan = np.full((31 * 24, 161, 281), np.nan, dtype="float32")
+    write_variable(tmp_path, "202601", "ssrdc", all_nan, {})
+    assert has_data(tmp_path, "202601", "ssrdc") is False   # 写过，但仍全 NaN
+
+    real = np.full((31 * 24, 161, 281), 1.0, dtype="float32")
+    write_variable(tmp_path, "202601", "t2m", real, {})
+    assert has_data(tmp_path, "202601", "t2m") is True
+
+
+def test_has_data_false_for_missing_month_or_variable(tmp_path: Path):
+    assert has_data(tmp_path, "209901", "t2m") is False   # 月库不存在
+    ensure_store(tmp_path, "202601")
+    assert has_data(tmp_path, "202601", "not_a_real_var") is False
 
 
 def test_write_variable_lands_values_and_provenance(tmp_path: Path):

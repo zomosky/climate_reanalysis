@@ -126,6 +126,24 @@ def read_provenance(store_dir: Path, month: str) -> dict:
     return json.loads(prov) if isinstance(prov, str) else dict(prov)
 
 
+def has_data(store_dir: Path, month: str, var: str) -> bool:
+    """该变量数组里是否存在任何非 NaN 值。
+
+    用于区分"骨架里有这个变量的数组"和"这个变量真的有数据"——真实 legacy
+    库里 ``ssrdc`` 就是前者不是后者：数组确实被写过，只是从未有真实数值填
+    进去，全是 NaN。这种情况不能只看数组存不存在，或者只看
+    ``nchunks_initialized`` 之类的结构信号（真实数据即使全 NaN 也已经写入过
+    chunk，结构上看跟"有数据"没有区别）——必须真的读一次值。
+    """
+    path = store_path(store_dir, month)
+    if not path.exists():
+        return False
+    g = zarr.open_group(str(path), mode="r")
+    if var not in set(g.array_keys()):
+        return False
+    return not bool(np.isnan(g[var][:]).all())
+
+
 def set_provenance(store_dir: Path, month: str, var: str, entry: dict) -> None:
     g = zarr.open_group(str(store_path(store_dir, month)), mode="r+")
     prov = dict(g.attrs).get(_PROV_KEY, {})

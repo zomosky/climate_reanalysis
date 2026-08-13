@@ -137,6 +137,82 @@ def test_curl_download_raises_if_persistently_short(monkeypatch, tmp_path: Path)
 
 
 # --------------------------------------------------------------------------- #
+# target.exists() 是 download_one 的缓存判据（"文件在=已完整"）。如果 curl 直接
+# 写 target，半途被杀（OOM/断电/curl 重试耗尽）会在 target 位置留下一个残缺文件——
+# 下次 cron 起来会把这个残缺文件当成"已经下好"，连 size_bytes/sha256 一起原样
+# 写进 manifest，向下游撒谎。必须写到 <target>.part，通过大小校验才 rename 成
+# target，使"target 存在"与"完整"重新等价；.part 仍留在磁盘供下次 -C - 续传。
+# --------------------------------------------------------------------------- #
+def test_curl_download_writes_to_part_then_atomic_rename(monkeypatch, tmp_path: Path):
+    _stub_head(monkeypatch)   # 不关心大小校验，跳过（无 Content-Length）
+    seen = {}
+
+    def fake_run(cmd, **kw):
+        seen["cmd"] = cmd
+        out = Path(cmd[cmd.index("-o") + 1])
+        assert out.name.endswith(".part")   # 必须写到 .part，不能直接写 target
+        out.write_bytes(b"data")
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    target = tmp_path / "out.bin"
+    curl_download("https://obj/x.zip", target, proxy=None)
+
+    assert target.read_bytes() == b"data"
+    assert not (tmp_path / "out.bin.part").exists()   # 成功后 rename，不留 .part
+
+
+def test_curl_download_never_leaves_target_when_interrupted(monkeypatch, tmp_path: Path):
+    """中断（这里用"耗尽 attempts"模拟同一后果）：target 绝不出现，残缺数据
+    留在 .part 里供下次续传——不能凭 target.exists() 误判成已完整。"""
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    _stub_head(monkeypatch, content_length=100)
+
+    def fake_run(cmd, **kw):
+        out = Path(cmd[cmd.index("-o") + 1])
+        out.write_bytes(b"x" * 40)   # 每次都只给 40/100，rc 却是 0
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    target = tmp_path / "out.bin"
+    with pytest.raises(RuntimeError, match="curl"):
+        curl_download("https://obj/x.zip", target, proxy=None, attempts=2)
+
+    assert not target.exists()
+    assert (tmp_path / "out.bin.part").exists()   # 残缺数据留着，供下次 -C - 续传
+
+
+def test_curl_download_resumes_from_part_file_left_by_a_previous_process(
+    monkeypatch, tmp_path: Path
+):
+    """模拟"上一轮进程被杀、.part 留在磁盘"的场景（新调用 = 下一次 cron）：
+    curl -C - 应当接着传（用 fake_run 对已存在 .part 的 append 模拟），
+    最终成功产出完整 target 且 .part 被清走。"""
+    _stub_head(monkeypatch, content_length=100)
+    part = tmp_path / "out.bin.part"
+    part.parent.mkdir(parents=True, exist_ok=True)
+    part.write_bytes(b"x" * 40)   # 模拟上一轮遗留的残缺 .part
+
+    calls = []
+
+    def fake_run(cmd, **kw):
+        calls.append(cmd)
+        out = Path(cmd[cmd.index("-o") + 1])
+        assert out == part          # 必须接着写同一个 .part，不是另起炉灶
+        with out.open("ab") as f:   # -C - 续传：接着补
+            f.write(b"y" * 60)
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    target = tmp_path / "out.bin"
+    curl_download("https://obj/x.zip", target, proxy=None)
+
+    assert len(calls) == 1
+    assert target.read_bytes() == b"x" * 40 + b"y" * 60
+    assert not part.exists()
+
+
+# --------------------------------------------------------------------------- #
 # make_client：session 的 trust_env 必须是 False——这是「curl 能用而 Python 不能」
 # 这条坑的核心断言，不能只验证「调用了就算过」。真的构造 ecmwf.datastores.Client()
 # 会在 __attrs_post_init__ 里发一次真实探测请求，所以必须打桩掉 Client 本身，

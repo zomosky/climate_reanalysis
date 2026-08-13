@@ -98,19 +98,29 @@ def curl_download(url: str, target: Path, proxy: str | None,
     curl 返回码 0 不代表文件完整（见 ``_expected_size`` 的注释）——下载完
     额外比对本地文件大小与远端声明的总长，不够则视为失败继续重试（沿用
     已经落盘的部分续传，不是从头再来）。
+
+    **写到 ``<target>.part``，通过大小校验后才 ``os.replace`` 成 target**：
+    ``target.exists()`` 是下游（``download_one``）唯一的缓存/完整性判据，
+    如果 curl 直接写 target，半途被杀（OOM、断电、docker 内存限制、或这里
+    的重试耗尽）会在 target 位置留下一个残缺文件——下一次调用会把它当"已经
+    下好"，连 size_bytes/sha256 一起原样写进 manifest，向下游撒谎。``.part``
+    不受这个判据约束，可以放心留在磁盘供下次 ``-C -`` 续传；同目录内 rename
+    是原子操作，不会出现"半个 target"的中间态。
     """
     target = Path(target)
     target.parent.mkdir(parents=True, exist_ok=True)
+    part = target.parent / f"{target.name}.part"
     expected = _expected_size(url, proxy)   # 只探测一次，url 在各次尝试间不变
     for i in range(1, attempts + 1):
         cmd = ["curl", "-sSL", "-C", "-", "--retry", "3", "--retry-delay", "5",
                "--retry-all-errors", "--connect-timeout", "30", "--fail"]
         if proxy:
             cmd += ["-x", proxy]
-        cmd += ["-o", str(target), url]
+        cmd += ["-o", str(part), url]
         r = subprocess.run(cmd)
-        have = target.stat().st_size if target.exists() else 0
+        have = part.stat().st_size if part.exists() else 0
         if r.returncode == 0 and (expected is None or have >= expected):
+            os.replace(part, target)   # target 出现即代表完整，不会有中间态
             return
         if r.returncode == 0:
             log.warning("curl_size_mismatch", have=have, expected=expected,

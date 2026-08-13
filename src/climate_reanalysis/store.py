@@ -16,8 +16,11 @@ from pathlib import Path
 import numpy as np
 import zarr
 
+from climate_reanalysis.logging_setup import get_logger
 from climate_reanalysis.period import month_hours
 from climate_reanalysis.variables import VAR_SPECS
+
+log = get_logger(__name__)
 
 _LATTICE = 0.25
 _TOL = 1e-6
@@ -32,6 +35,25 @@ CHUNK = 8       # 读取粒度（zarr v3 sharding）
 _PROV_KEY = "zrread_provenance"
 
 _SKELETON_COORDS = ("time", "latitude", "longitude")
+
+
+class StoreCorruptedError(RuntimeError):
+    """月库无法打开——磁盘级损坏，不是「骨架未建完」。
+
+    绝不能在这种情况下自动重建：库里可能还有幸存的真实数据/溯源，``mode="w"``
+    会把它们连同损坏的部分一起清空，而且不出任何异常、不留任何日志。必须
+    人工介入（检查/删除该月库后重新 download + restore）。
+    """
+
+
+class IncompleteStoreHasDataError(RuntimeError):
+    """月库骨架不完整（缺 consolidated 元数据或坐标/变量不全），但库里已经有
+    真实数据或溯源——多半是建骨架/写入中途崩溃留下的半成品，而不是从未使用
+    过的空壳。
+
+    自动重建会静默清空这些已有内容，所以拒绝重建、抛错点名，交给人工核实
+    「哪些变量已经有数据」之后再决定是重建还是修复。
+    """
 
 
 def store_path(store_dir: Path, month: str) -> Path:
@@ -61,42 +83,55 @@ def check_area_matches_grid(area: tuple[float, float, float, float]) -> None:
         )
 
 
-def _skeleton_is_complete(path: Path) -> bool:
-    """完整性判据：consolidated 元数据存在，且骨架坐标与全部变量齐全。
+def _required_members() -> set[str]:
+    return set(_SKELETON_COORDS) | set(VAR_SPECS)
 
-    ``path.exists()``（目录在）不等于「骨架建完」——建骨架途中崩溃会在磁盘上
-    留下一个只有部分数组、缺坐标的 group；若拿路径存在当判据，这个残缺库会被
-    永久当成完整，之后任何一次 write_variable 都会在它之上写入数据、再把这个
-    残缺状态用它*自己*的 consolidate 调用标记成「完整」——错误从此再也不会被
-    发现。consolidated 元数据是本项目统一的完成标记（同 write_variable 的
-    「写入顺序：数据 → 溯源 → consolidated 元数据」），故检查它是否存在、以及
-    它记录的成员是否覆盖全部契约坐标与变量，而不是只看目录在不在。
+
+def _open_existing_or_raise(path: Path, month: str, mode: str = "r+"):
+    """打开一个已确认存在（``path.exists()``）的月库。打不开视为磁盘级损坏——
+    不是「骨架未建完」，绝不能吞掉异常后当「不存在」处理（那会让调用方掉进
+    ``mode="w"`` 重建分支，把损坏库上任何幸存内容静默清空，见
+    ``StoreCorruptedError`` 的说明）。
     """
-    if not path.exists():
-        return False
     try:
-        g = zarr.open_group(str(path), mode="r")
-    except Exception:
-        return False
-    consolidated = g.metadata.consolidated_metadata
-    if consolidated is None:
-        return False
-    members = set(consolidated.metadata.keys())
-    required = set(_SKELETON_COORDS) | set(VAR_SPECS)
-    return required.issubset(members)
+        return zarr.open_group(str(path), mode=mode)
+    except Exception as exc:
+        raise StoreCorruptedError(
+            f"{month} 月库无法打开：{path}（{exc!r}）——这是磁盘级损坏，不是"
+            "「未建完」，不会自动重建；需要人工检查/删除该月库、必要时重新 "
+            "download + restore"
+        ) from exc
 
 
-def ensure_store(store_dir: Path, month: str) -> Path:
-    """月库骨架不完整（含不存在）则按契约新建/重建（全 NaN 骨架）；已完整则原样返回。
+def _has_real_content(g) -> bool:
+    """已打开的 group 里是否存在任何真实数据或溯源——骨架不完整时用来判断能不能
+    安全重建，任意一项为真都不许重建（会清空）。
 
-    「重建」用 ``mode="w"`` 整体覆盖——会连带清掉崩溃留下的残缺内容，不会跟旧
-    的部分数组混在一起产出更奇怪的状态。
+    数据数组要真的读一次值判断（不能只看数组存不存在），理由同 ``has_data``：
+    真实 legacy 库的 ``ssrdc`` 数组确实被建过，只是从未写入真实数值，结构上跟
+    "有数据"没有区别。任何一个数组读取失败也保守地当作"有内容"，不放行自动
+    重建（读取失败本身就说明这不是一个安全可以覆盖的空壳）。
+    """
+    if dict(g.attrs).get(_PROV_KEY):
+        return True
+    for name in g.array_keys():
+        if name in _SKELETON_COORDS:
+            continue
+        try:
+            if not bool(np.isnan(g[name][:]).all()):
+                return True
+        except Exception:
+            return True
+    return False
+
+
+def _build_skeleton(path: Path, month: str):
+    """新建/重建全 NaN 骨架（``mode="w"`` 整体覆盖），返回打开的、可写的 group
+    句柄。调用方须自行确保这一步是安全的（路径不存在，或已确认是空壳）——本
+    函数不做这个判断，只管建。
 
     未写入的 chunk 零内存零磁盘——完整一月骨架实测仅 0.03 MB（逻辑 0.67 GB）。
     """
-    path = store_path(store_dir, month)
-    if _skeleton_is_complete(path):
-        return path
     times = month_hours(month)
     n = times.size
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -137,7 +172,60 @@ def ensure_store(store_dir: Path, month: str) -> Path:
         _PROV_KEY: {},
     })
     zarr.consolidate_metadata(g.store)   # 完成标记最后写
-    return path
+    return g
+
+
+def _ensure_store_group(store_dir: Path, month: str):
+    """确保月库骨架完整，返回一个已打开、可写（``mode="r+"``）的 group 句柄——
+    ``write_variable`` 直接复用这个句柄写入，不必在确认完整之后再重新 open
+    一次（避免对已完整库的重复 I/O）。
+
+    四种情况，分开处理，不合并（合并就是本条 Critical 修复之前的 bug）：
+
+    1. 路径不存在——新建骨架，没有东西可丢，``mode="w"`` 安全。
+    2. 能打开、骨架齐全（consolidated 元数据存在且覆盖全部契约坐标与变量）——
+       直接返回这个句柄。
+    3. 能打开、骨架不齐（建到一半崩溃）：
+       - 已经有真实数据或溯源——**不许清空**，抛 ``IncompleteStoreHasDataError``
+         点名月份、路径，交给人工决定。
+       - 确认是空壳（无数据无溯源）——安全重建，打日志说明原因。
+    4. 打不开／打开时报错（损坏）——``_open_existing_or_raise`` 直接抛
+       ``StoreCorruptedError``，绝不重建。
+    """
+    path = store_path(store_dir, month)
+    if not path.exists():
+        return _build_skeleton(path, month)
+
+    g = _open_existing_or_raise(path, month, mode="r+")
+    consolidated = g.metadata.consolidated_metadata
+    complete = consolidated is not None and _required_members().issubset(
+        set(consolidated.metadata.keys())
+    )
+    if complete:
+        return g
+    if _has_real_content(g):
+        raise IncompleteStoreHasDataError(
+            f"{month} 月库骨架不完整（{path}），但已经检测到真实数据或溯源——"
+            "为避免静默清空，拒绝自动重建；请人工核实该月已有哪些变量的数据"
+            "后再决定重建还是修复"
+        )
+    log.warning(
+        "rebuilding_empty_skeleton", month=month, path=str(path),
+        reason="骨架不完整（缺 consolidated 元数据或坐标/变量不全），但确认"
+              "是空壳（无数据无溯源）——安全重建",
+    )
+    return _build_skeleton(path, month)
+
+
+def ensure_store(store_dir: Path, month: str) -> Path:
+    """月库骨架不完整（含不存在）则按契约新建/重建（全 NaN 骨架）；已完整则
+    原样返回；骨架不齐但已有真实数据、或库已损坏打不开，则拒绝重建、抛错点名
+    （四种情况的完整说明见 ``_ensure_store_group``）。
+
+    对外只返回 ``Path``——沿用既有契约，测试与 migrate/cli 都按这个签名用。
+    """
+    _ensure_store_group(store_dir, month)
+    return store_path(store_dir, month)
 
 
 def _normalize_provenance(raw) -> dict:
@@ -192,9 +280,12 @@ def write_variable(
     崩溃的库不会被误判为完整。溯源这一步复用 ``set_provenance``（而不是自己
     再读改写一遍 attrs）——三处各自维护同一段 str-or-dict 归一逻辑容易漂移，
     这里数据先落盘、再调用它，consolidate 仍然是最后发生的事。
+
+    直接走 ``_ensure_store_group`` 拿一个已确认完整、已打开的可写句柄——不再
+    像 ``ensure_store`` 那样只拿一个 ``Path`` 再重新 open 一次（对已完整库是
+    纯重复 I/O：完整性判据本身就需要 open 一次读 consolidated 元数据）。
     """
-    path = ensure_store(store_dir, month)
-    g = zarr.open_group(str(path), mode="r+")
+    g = _ensure_store_group(store_dir, month)
     expect = (month_hours(month).size, TARGET_LAT.size, TARGET_LON.size)
     if tuple(data.shape) != expect:
         raise ValueError(f"{month}/{var}: 形状 {data.shape} != 契约 {expect}")

@@ -15,6 +15,8 @@ from climate_reanalysis.store import (
     SHARD,
     TARGET_LAT,
     TARGET_LON,
+    IncompleteStoreHasDataError,
+    StoreCorruptedError,
     check_area_matches_grid,
     ensure_store,
     has_data,
@@ -66,17 +68,21 @@ def test_ensure_store_is_idempotent(tmp_path: Path):
     assert read_provenance(tmp_path, "202601")["ssrd"]["manifest_sha256"] == "abc"
 
 
-def test_ensure_store_rebuilds_a_skeleton_left_incomplete_by_a_crash(tmp_path: Path):
-    """建骨架途中崩溃的现实后果（审查实测）：库里只有 t2m 一个数组、没有
-    time/latitude/longitude 坐标，却被后续 write_variable 自己的 consolidate
-    标成「完整」——path.exists() 为真，永远不会被重建。
+def test_ensure_store_rebuilds_an_empty_shell_left_incomplete_by_a_crash(
+    tmp_path: Path, capsys
+):
+    """情况 3b：建骨架途中崩溃，且崩溃前落盘的这一个数组还没来得及写任何真实
+    值（``fill_value=np.nan``，跟 ``_build_skeleton`` 真实创建数组时一致）——
+    库里只有 t2m 一个全 NaN 数组、没有 time/latitude/longitude 坐标，却被
+    consolidate 标成看似「完整」（path.exists() 为真，若只看这一条会永远不
+    被重建）。
 
-    这里直接构造这种残缺状态（只建一个数组就 consolidate，模拟"崩溃前只做完
-    这一步"），断言 ensure_store 必须识别出它不完整并整体重建，而不是原样放行。
+    这是一个确认过的空壳（无真实数据、无溯源），安全重建；断言 ensure_store
+    识别出不完整并整体重建，且打了日志说明重建原因。
     """
     p = store_path(tmp_path, "202601")
     g = zarr.open_group(str(p), mode="w")
-    g.create_array("t2m", shape=(31 * 24, 161, 281), dtype="float32")
+    g.create_array("t2m", shape=(31 * 24, 161, 281), dtype="float32", fill_value=np.nan)
     zarr.consolidate_metadata(g.store)   # 残缺状态被就地"标记"成看似完整
 
     # 修复前：path.exists() 为真就直接放行，下面的断言会在残缺库上失败。
@@ -89,6 +95,120 @@ def test_ensure_store_rebuilds_a_skeleton_left_incomplete_by_a_crash(tmp_path: P
     }
     assert ds.sizes == {"time": 31 * 24, "latitude": 161, "longitude": 281}
     assert np.isnan(ds["t2m"].values).all()   # 重建后是全 NaN 骨架，不是残缺数组里的垃圾值
+
+    out = capsys.readouterr().out
+    assert "rebuilding_empty_skeleton" in out and "202601" in out
+
+
+def test_ensure_store_refuses_to_rebuild_incomplete_skeleton_with_real_data(
+    tmp_path: Path
+):
+    """情况 3a：骨架不完整，但已经写入过真实数据（不是全 NaN 骨架值）——多半是
+    在"写完部分变量的真实数据"之后、"补全其余变量/坐标"之前崩溃。此时绝不能
+    像情况 3b 那样自动 ``mode="w"`` 重建：那会把这份真实数据静默清空，且不抛
+    任何异常、不留任何日志。必须拒绝重建、抛错点名，交给人工核实。"""
+    p = store_path(tmp_path, "202601")
+    g = zarr.open_group(str(p), mode="w")
+    arr = g.create_array("t2m", shape=(31 * 24, 161, 281), dtype="float32",
+                         fill_value=np.nan)
+    arr[:] = 5.0   # 真实数据，不是骨架 NaN
+    zarr.consolidate_metadata(g.store)   # 骨架仍不完整：缺其余 8 个变量、缺三个坐标
+
+    with pytest.raises(IncompleteStoreHasDataError, match="202601"):
+        ensure_store(tmp_path, "202601")
+
+    # 核心断言：数据必须原封不动——不能被这次被拒绝的 ensure_store 调用清空。
+    g2 = zarr.open_group(str(p), mode="r")
+    assert float(g2["t2m"][0, 0, 0]) == 5.0
+
+
+def test_ensure_store_refuses_to_rebuild_incomplete_skeleton_with_only_provenance(
+    tmp_path: Path
+):
+    """情况 3a 的另一种真实内容信号：数据数组本身还是骨架 NaN（还没来得及写
+    真实值），但溯源已经先落盘（``write_variable`` 的写入顺序是数据→溯源→
+    consolidated；如果崩溃发生在"溯源写完、但下一个变量的数据还没开始写"这个
+    间隙，consolidated 元数据本身甚至可能还没刷新到最新——溯源本身就足以说明
+    这不是一个从未使用过的空壳）。仅凭数据数组全 NaN 不能判定"没有真实内容"。
+    """
+    p = store_path(tmp_path, "202601")
+    g = zarr.open_group(str(p), mode="w")
+    g.create_array("t2m", shape=(31 * 24, 161, 281), dtype="float32", fill_value=np.nan)
+    g.attrs["zrread_provenance"] = {"t2m": {"manifest_sha256": "deadbeef"}}
+    zarr.consolidate_metadata(g.store)   # 骨架仍不完整：缺其余变量、缺坐标
+
+    with pytest.raises(IncompleteStoreHasDataError, match="202601"):
+        ensure_store(tmp_path, "202601")
+
+    g2 = zarr.open_group(str(p), mode="r")
+    assert dict(g2.attrs)["zrread_provenance"]["t2m"]["manifest_sha256"] == "deadbeef"
+
+
+def test_ensure_store_refuses_to_rebuild_a_corrupted_store(tmp_path: Path):
+    """情况 4：库根本打不开（磁盘级损坏）——审查实测场景：健康月库（t2m/sp/ssrd
+    都有真实数据+溯源）→ 把 root zarr.json 截断损坏 → 修复前的宽 except 会把
+    这种"打不开"误判成"没建完"，进而用 mode="w" 整体重建，把全部真实数据和
+    溯源静默清空（不抛异常、不打日志）。
+
+    这里直接复现该场景：先建一个有真实数据+溯源的健康库，截断 root zarr.json，
+    断言 ensure_store 拒绝重建并抛错点名；再把 zarr.json 还原，确认底下的数据
+    数组、溯源全都原封不动（没有被之前失败的调用动过）。
+    """
+    ensure_store(tmp_path, "202601")
+    data = np.full((31 * 24, 161, 281), 3.0, dtype="float32")
+    write_variable(tmp_path, "202601", "t2m", data, {"manifest_sha256": "sha-t2m"})
+    write_variable(tmp_path, "202601", "sp", data, {"manifest_sha256": "sha-sp"})
+
+    p = store_path(tmp_path, "202601")
+    root_meta = p / "zarr.json"
+    original_bytes = root_meta.read_bytes()
+    root_meta.write_bytes(b"{not valid json")   # 模拟磁盘级损坏（截断/写坏）
+
+    with pytest.raises(StoreCorruptedError, match="202601"):
+        ensure_store(tmp_path, "202601")
+
+    # 还原损坏的元数据文件，证明失败的 ensure_store 调用没有碰过任何数据数组
+    # 或其它文件——库里的真实内容跟损坏之前逐字节一致。
+    root_meta.write_bytes(original_bytes)
+    ds = xr.open_zarr(p, consolidated=True)
+    np.testing.assert_allclose(ds["t2m"].values, 3.0)
+    np.testing.assert_allclose(ds["sp"].values, 3.0)
+    prov = read_provenance(tmp_path, "202601")
+    assert prov["t2m"]["manifest_sha256"] == "sha-t2m"
+    assert prov["sp"]["manifest_sha256"] == "sha-sp"
+
+
+def test_write_variable_refuses_to_touch_a_corrupted_store(tmp_path: Path):
+    """审查复现的确切场景（``write_variable`` 层面，而不是 ``ensure_store``）：
+    健康月库写好 t2m/sp/ssrd 之后损坏，再对同一个库调用 ``write_variable`` 写
+    一个新变量 u100——这才是 restore.py 实际调用的入口。必须拒绝写入并抛错，
+    不能像修复前那样把其余变量的数据/溯源静默清空、只剩 u100。"""
+    ensure_store(tmp_path, "202601")
+    data = np.full((31 * 24, 161, 281), 1.0, dtype="float32")
+    write_variable(tmp_path, "202601", "t2m", data, {"manifest_sha256": "sha-t2m"})
+    write_variable(tmp_path, "202601", "sp", data, {"manifest_sha256": "sha-sp"})
+    write_variable(tmp_path, "202601", "ssrd", data, {"manifest_sha256": "sha-ssrd"})
+
+    p = store_path(tmp_path, "202601")
+    root_meta = p / "zarr.json"
+    original_bytes = root_meta.read_bytes()
+    root_meta.write_bytes(b"{not valid json")
+
+    with pytest.raises(StoreCorruptedError, match="202601"):
+        write_variable(tmp_path, "202601", "u100",
+                       np.full((31 * 24, 161, 281), 9.0, dtype="float32"), {})
+
+    root_meta.write_bytes(original_bytes)
+    ds = xr.open_zarr(p, consolidated=True)
+    np.testing.assert_allclose(ds["t2m"].values, 1.0)
+    np.testing.assert_allclose(ds["sp"].values, 1.0)
+    np.testing.assert_allclose(ds["ssrd"].values, 1.0)
+    assert np.isnan(ds["u100"].values).all()   # u100 没有被写入——调用在写入前就报错了
+    prov = read_provenance(tmp_path, "202601")
+    assert prov["t2m"]["manifest_sha256"] == "sha-t2m"
+    assert prov["sp"]["manifest_sha256"] == "sha-sp"
+    assert prov["ssrd"]["manifest_sha256"] == "sha-ssrd"
+    assert "u100" not in prov
 
 
 def test_has_data_distinguishes_all_nan_from_real_values(tmp_path: Path):

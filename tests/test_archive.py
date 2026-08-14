@@ -117,3 +117,52 @@ def test_dry_run_does_not_require_cold_sentinel(tmp_path: Path):
     md, sd, cd, raw = _setup(tmp_path)   # cd 未创建、也没有哨兵
     moved, skipped = archive(md, sd, cd)   # execute 默认 False，不应报错
     assert moved == 1 and skipped == 0
+
+
+def test_archive_twice_recognizes_already_archived_without_crashing(tmp_path: Path):
+    """已归档过的 manifest 第二次跑：热端已空、冷端已有正确 sha 副本——必须
+    识别为"已归档，跳过"，不能对着不存在的热端文件再拷贝一次而崩溃、拖累
+    这一整轮里排在它后面的其它 manifest。"""
+    md, sd, cd, raw = _setup(tmp_path, mount_cold=True)
+    moved1, skipped1 = archive(md, sd, cd, execute=True)
+    assert moved1 == 1 and skipped1 == 0
+    assert not raw.exists()
+
+    moved2, skipped2 = archive(md, sd, cd, execute=True)   # 不抛异常
+    assert moved2 == 0
+    assert skipped2 == 1
+
+
+def test_dry_run_after_archiving_reports_already_archived_as_skipped_not_moved(
+    tmp_path: Path,
+):
+    """dry-run 此前恒报 skipped=0，且把已归档的文件也计进 would_move——预览
+    数量因此不可信。已归档过一次之后再跑预览，这份文件不该再算进"将搬"。"""
+    md, sd, cd, raw = _setup(tmp_path, mount_cold=True)
+    archive(md, sd, cd, execute=True)          # 先真正归档一次
+    assert not raw.exists()
+
+    moved, skipped = archive(md, sd, cd)        # 再跑一次预览（execute 默认 False）
+    assert moved == 0
+    assert skipped == 1
+
+
+def test_copy_failure_leaves_no_orphan_tmp_and_does_not_abort_the_run(
+    tmp_path: Path, monkeypatch
+):
+    """拷贝中途失败（如目标盘满）：不许在冷盘留下孤儿 tmp 文件，也不许让这一份
+    manifest 的失败中止整轮扫描——失败计入 skipped，热端保留。"""
+    md, sd, cd, raw = _setup(tmp_path, mount_cold=True)
+    import climate_reanalysis.archive as mod
+
+    def _boom(src, dst):
+        Path(dst).write_bytes(b"partial-copy")   # 模拟拷贝写了一半才失败
+        raise OSError("设备已满（模拟）")
+
+    monkeypatch.setattr(mod.shutil, "copy2", _boom)
+
+    moved, skipped = archive(md, sd, cd, execute=True)   # 不抛异常
+
+    assert moved == 0 and skipped == 1
+    assert raw.exists()                      # 热端未动
+    assert not list(cd.rglob("*.tmp"))       # 没有孤儿临时文件残留

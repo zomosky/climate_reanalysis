@@ -120,6 +120,26 @@ def archivable(manifest_dir: Path, store_dir: Path) -> list[Path]:
     return out
 
 
+def _already_archived(cold_dir: Path, month: str, files: list[dict]) -> bool:
+    """判断这份 manifest 涉及的原始文件是不是已经归档过——热端全部不在、
+    冷端全部在且 sha 与 manifest 记录一致。``archivable()`` 的判据只看月库
+    溯源 sha，不看热端文件在不在，所以一份已经归档过的 manifest 在下一轮
+    扫描里仍会出现在候选列表里；不加这个判断的话，``_archive_one`` 会对着
+    一个已经不存在的热端文件调用 ``shutil.copy2`` 而抛 ``FileNotFoundError``。
+
+    任何一个文件热端还在，就不算"已归档"（可能是上一轮部分失败的中间态，
+    交给正常的 ``_archive_one`` 流程重新走一遍，不在这里特判）。
+    """
+    for f in files:
+        if Path(f["path"]).exists():
+            return False
+    for f in files:
+        cold = cold_path(cold_dir, month, Path(f["path"]).name)
+        if not cold.exists() or _sha256_of(cold) != f["sha256"]:
+            return False
+    return True
+
+
 def _archive_one(cold_dir: Path, month: str, files: list[dict]) -> bool:
     """搬一份 manifest 涉及的全部原始文件。全部校验通过才动热端；任意一步
     失败都返回 False、不删任何热端文件（调用方据此计入"跳过"）。
@@ -140,8 +160,11 @@ def _archive_one(cold_dir: Path, month: str, files: list[dict]) -> bool:
             # tmp 名带 pid，同 manifest.py 写 manifest 的做法——避免两个并发
             # 归档进程互相踩踏出半成品文件
             tmp = cold.with_name(f"{cold.name}.{os.getpid()}.tmp")
-            shutil.copy2(hot, tmp)
+            # 必须在 copy2 之前登记：copy2 中途失败（如目标盘满）也可能已经在
+            # 磁盘上留下半截 tmp 文件——登记晚了，这半截文件就不在 finally 的
+            # 清理清单里，会变成孤儿残留在冷盘上
             created_tmp.append(tmp)
+            shutil.copy2(hot, tmp)
             got = _sha256_of(tmp)
             if got != f["sha256"]:
                 log.warning(
@@ -187,6 +210,9 @@ def archive(
 
     ``execute=False``（默认）只统计"将搬"多少文件，不碰任何文件——归档会
     删热端，代价是这批原始文件此后只能靠冷端自愈，必须先看清楚数量再决定。
+    预览这一步同样会识别"已经归档过"的 manifest 并计入 ``skipped`` 而不是
+    ``moved``——不然 dry-run 报出来的"将搬 N 个"是不可信的，重复统计早就
+    搬过的文件。
 
     ``cold_dir=None`` 一律拒绝执行（哪怕只是预览）并抛错：出厂就是未配置，
     不给任何看似无害的默认路径，本机/测试环境通常没有那块盘。
@@ -194,6 +220,14 @@ def archive(
     ``execute=True`` 时额外要求 ``cold_dir`` 通过 ``_require_cold_sentinel``
     的挂载确认——预览不写盘，不强制要求；真正要写盘（会在冷盘没挂载时把
     目录树建到热盘上）之前必须确认过。
+
+    **逐 manifest 处理，一份失败不许中止整轮**：``archivable()`` 的判据不看
+    热端文件在不在，已经归档过的 manifest 下一轮扫描仍会出现在候选列表里；
+    此外 ``_archive_one`` 内部的 ``shutil.copy2`` 可能因为目标盘满等原因抛
+    ``OSError``。这两种情况都必须被这里的 try/except 接住、计入
+    ``skipped`` 并告警，绝不能让一份 manifest 的意外状况挡住排在它后面的
+    其它 manifest（此前的实现没有这层保护：重复归档会直接崩在
+    ``FileNotFoundError`` 上，整轮从第一份就中止）。
     """
     if cold_dir is None:
         raise ValueError(
@@ -208,14 +242,25 @@ def archive(
     moved = 0
     skipped = 0
     for mf in candidates:
-        d = read_manifest(mf)
-        files = d["files"]
-        if not execute:
-            moved += len(files)
-            continue
-        if _archive_one(cold_dir, d["period"], files):
-            moved += len(files)
-            log.info("archived", month=d["period"], var=d["variable"], files=len(files))
-        else:
+        try:
+            d = read_manifest(mf)
+            files = d["files"]
+            if _already_archived(cold_dir, d["period"], files):
+                skipped += 1
+                continue
+            if not execute:
+                moved += len(files)
+                continue
+            if _archive_one(cold_dir, d["period"], files):
+                moved += len(files)
+                log.info("archived", month=d["period"], var=d["variable"],
+                         files=len(files))
+            else:
+                skipped += 1
+        except Exception as exc:  # noqa: BLE001 - 单份 manifest 失败不中断整轮
+            log.error(
+                "archive_manifest_failed", manifest=str(mf), error=str(exc),
+                hint="这份 manifest 处理失败，已跳过，不影响其余 manifest",
+            )
             skipped += 1
     return moved, skipped

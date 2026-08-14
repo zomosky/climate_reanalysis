@@ -9,9 +9,12 @@ import numpy as np
 import pytest
 
 from climate_reanalysis import cli
+from climate_reanalysis.manifest import manifest_path, write_manifest
 from climate_reanalysis.settings import Settings
-from climate_reanalysis.store import ensure_store, read_provenance, write_variable
+from climate_reanalysis.store import ensure_store, read_provenance, set_provenance, write_variable
 from climate_reanalysis.variables import VAR_SPECS
+
+_AREA = (55.0, 70.0, 15.0, 140.0)
 
 
 def _settings_yaml(tmp_path: Path) -> Path:
@@ -194,3 +197,68 @@ def test_migrate_stamps_store_and_restore_then_leaves_it_alone(tmp_path):
     # manifest 目录是空的（没下载过），restore 因此无事可做——不会把刚打的 legacy 标记冲掉
     assert cli.main(["--config", str(cfg), "restore"]) == 0
     assert read_provenance(s.store_dir, "202601")["ssrd"]["source"] == "legacy:x"
+
+
+def _stale_era5t_month(tmp_path: Path, s: Settings) -> None:
+    """造一个「过期未换新」的月份：月库溯源记着仍是初步值，且已有对应 manifest
+    （模拟当初 download 真的跑过一次）。"""
+    ensure_store(s.store_dir, "202601")
+    set_provenance(s.store_dir, "202601", "t2m",
+                   {"manifest_sha256": "sha", "expver": ["0005"]})
+    raw = tmp_path / "x.nc"
+    raw.write_bytes(b"x")
+    write_manifest(s.manifest_dir, "202601", "t2m", [raw], _AREA)
+
+
+def test_refresh_on_empty_store_is_a_noop(tmp_path):
+    cfg = _settings_yaml(tmp_path)
+    assert cli.main(["--config", str(cfg), "refresh"]) == 0
+
+
+def test_refresh_defaults_to_dry_run_and_deletes_nothing(tmp_path, capsys):
+    """删 manifest 会触发真实重下，代价很实在——不加 --yes 必须是纯预览，一个
+    manifest 都不能少，哪怕确实有过期月份可刷。"""
+    cfg = _settings_yaml(tmp_path)
+    s = Settings(raw_dir=tmp_path / "raw", manifest_dir=tmp_path / "manifests",
+                store_dir=tmp_path / "store")
+    _stale_era5t_month(tmp_path, s)
+
+    rc = cli.main(["--config", str(cfg), "refresh", "--today", "2026-06-01"])
+
+    assert rc == 0
+    assert manifest_path(s.manifest_dir, "202601", "t2m").exists()
+    out = capsys.readouterr().out
+    assert "refresh_item" in out
+    assert "refresh_dry_run" in out
+
+
+def test_refresh_with_yes_deletes_only_the_manifest(tmp_path):
+    """--yes 才真删，且只删 manifest——月库溯源（含 expver）一字不动，重建
+    交给下一轮 download + restore 的 sha 比对自然触发。"""
+    cfg = _settings_yaml(tmp_path)
+    s = Settings(raw_dir=tmp_path / "raw", manifest_dir=tmp_path / "manifests",
+                store_dir=tmp_path / "store")
+    _stale_era5t_month(tmp_path, s)
+
+    rc = cli.main(["--config", str(cfg), "refresh", "--today", "2026-06-01", "--yes"])
+
+    assert rc == 0
+    assert not manifest_path(s.manifest_dir, "202601", "t2m").exists()
+    assert read_provenance(s.store_dir, "202601")["t2m"]["expver"] == ["0005"]
+
+
+def test_refresh_after_days_overrides_config_default(tmp_path):
+    """--after-days 显式传参覆盖配置里的 refresh_after_days（出厂 100）——月末
+    到 today 只过了 20 天，默认窗口下不该刷新，但传一个更短的窗口应当刷新。"""
+    cfg = _settings_yaml(tmp_path)
+    s = Settings(raw_dir=tmp_path / "raw", manifest_dir=tmp_path / "manifests",
+                store_dir=tmp_path / "store")
+    _stale_era5t_month(tmp_path, s)
+
+    rc = cli.main(["--config", str(cfg), "refresh", "--today", "2026-02-20"])
+    assert manifest_path(s.manifest_dir, "202601", "t2m").exists()  # 默认窗口内，不刷新
+
+    rc = cli.main(["--config", str(cfg), "refresh", "--today", "2026-02-20",
+                  "--after-days", "10", "--yes"])
+    assert rc == 0
+    assert not manifest_path(s.manifest_dir, "202601", "t2m").exists()

@@ -23,3 +23,7 @@ concurrency: 4
 
 # ERA5 发布延迟：月末再等这么多天才认为该月齐全
 publish_lag_days: 5
+
+# ERA5T 初步数据（expver=0005）换新窗口：月末再等这么多天才认为该月的初步值
+# 已经"过期"、该用 refresh 重新拉一遍 final（final 实测滞后 2-3 个月才发布）
+refresh_after_days: 100

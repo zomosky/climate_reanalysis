@@ -27,6 +27,9 @@ class Settings(BaseModel):
     concurrency: int = 4
     #: ERA5 发布延迟：月末再等这么多天才认为该月齐全（实测 T-5 可得、T-3 不可得）
     publish_lag_days: int = 5
+    #: ERA5T 初步数据换新窗口：月末再等这么多天才认为该月的初步值（expver=0005）
+    #: 已经"过期"、该重新拉一遍 final（final 实测滞后 2-3 个月）
+    refresh_after_days: int = 100
     #: 请求区域 (N, W, S, E)，与产出网格同框
     area: tuple[float, float, float, float] = (55.0, 70.0, 15.0, 140.0)
     #: 指定 .cdsapirc；None = ~/.cdsapirc。按惯例是 home 下的凭据文件，故与上面三个

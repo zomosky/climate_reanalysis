@@ -12,6 +12,7 @@ from climate_reanalysis.settings import Settings, load_settings
 def test_defaults_match_spec():
     s = Settings()
     assert s.publish_lag_days == 5          # 实测 T-5 可得、T-3 不可得
+    assert s.refresh_after_days == 100      # final 实测滞后 2-3 个月才发布
     assert s.area == (55.0, 70.0, 15.0, 140.0)   # N W S E，与产出网格同框
     assert s.concurrency == 4
     assert s.dl_proxy is None               # 不得硬编码代理

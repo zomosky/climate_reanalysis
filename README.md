@@ -46,6 +46,7 @@ cp config/settings.yaml.example config/settings.yaml
 | `dl_proxy` | **只用于 bulk download**，submit/poll 一律直连；留空 = 裸连 |
 | `concurrency` | 每期并发下载的（月×变量）任务数，出厂 4 |
 | `publish_lag_days` | ERA5 发布延迟（天），出厂 5——月末再等这么多天才认为该月齐全 |
+| `refresh_after_days` | ERA5T 初步数据换新窗口（天），出厂 100——月末再等这么多天才认为初步值「过期」，见下方「ERA5T 刷新」 |
 | `area` | 请求区域 `(N, W, S, E)`，需与产出网格 15–55N / 70–140E 一致 |
 | `cdsapirc` | 指定 `.cdsapirc` 路径；留空 = `~/.cdsapirc`（多账号轮换时可另起一份） |
 
@@ -114,6 +115,41 @@ uv run climate_reanalysis cleanup-jobs --yes              # 确认预览无误�
 正跑着的任务没有撤销的余地，只应该在确认清楚账号上都是自己的任务时手动执行。**不加
 `--yes` 是默认行为、且不做任何实际删除**：只按状态分类打印将要删除的数量与若干示例
 id，供人工核对账号/统计对不对；确认无误后再加 `--yes` 重跑一次才会真正执行删除。
+
+## ERA5T 刷新
+
+ERA5 有两种成色：**ERA5T 初步数据**（`expver=0005`，滞后约 5 天可得，数值可能被
+后续修订）与 **final 正式数据**（`expver=0001`，滞后 2–3 个月）。`restore` 会把
+原始文件的 `expver` 坐标记进月库溯源（`zrread_provenance[变量].expver`），但**落盘
+后没有任何自动换新通路**——初步值写进去之后，除非手动介入，永远不会被替换成 final。
+
+`refresh` 补的就是这个通路。**它不去教 `download` 认得月库结构**——两个单元只通过
+manifest 通信，这是刻意保持的契约——而是把过期月份对应的 manifest **删掉**，让既有
+的 `download → restore` 流程自然把它们当成「没下过」重新走一遍：新下载产生新
+manifest，sha 与月库溯源里记的旧 sha 天然对不上，`restore` 就会按幂等规则重建那个
+变量。`refresh` 本身**不联网、不写任何新文件、不碰月库数据**，只做「找出过期月份」
+和「删 manifest」两件事。
+
+判据：该 (月, 变量) 的溯源 `expver` 里含 `"0005"`（哪怕只是跨边界月份的一部分），
+且该月月末距今已超过 `refresh_after_days` 天（出厂 100，留出比 final 实测 2–3 个月
+发布滞后更宽松的余量）。**缺 `expver` 键的老条目一律视为不需要刷新**——`migrate`
+打的 legacy 标记、更早版本写的溯源都没有这个字段，宁可漏刷，也不要把没记录这个
+字段的历史数据（可能是几十 GB、几十小时排队量级）全部当成待刷新对象重下。
+
+```bash
+uv run climate_reanalysis refresh                              # 默认 dry-run：只打印清单，不删
+uv run climate_reanalysis refresh --after-days 60               # 覆盖配置里的 refresh_after_days
+uv run climate_reanalysis refresh --today 2026-06-01             # 覆盖“今天”，便于核对判据
+uv run climate_reanalysis refresh --yes                          # 确认清单无误后，加 --yes 才真删
+```
+
+**不加 `--yes` 是默认行为、不删任何文件**——删 manifest 会触发真实重下，代价是排队
+时间和带宽，必须先看清楚清单再决定。**`refresh --yes` 执行完之后，必须再手动跑一次
+`download` + `restore`**（`refresh` 自己不做这两步）：manifest 没了之后，`download`
+才会把这些 (月, 变量) 当成「没下过」重新发起真实 CDS 请求，`restore` 再把新结果
+（连带新的 `expver`）切回月库，完成真正的换新。这条通路与「raw 清理后月库损坏」
+一节里的手工恢复步骤是同一套底层机制（删 manifest → 触发 sha 不符 → 自然重建），
+`refresh` 只是把它包装成一个显式、可预览、按 ERA5T 判据自动找出目标的命令。
 
 ## 历史迁移（一次性）
 
@@ -242,6 +278,7 @@ src/climate_reanalysis/
   download.py    单元 A：按（月×产出变量）下载并写 manifest
   restore.py     单元 B：scan-once 幂等切库
   migrate.py     单元 C：历史迁移，打 legacy 溯源
+  refresh.py     ERA5T 刷新：删过期月份的 manifest，交给 download+restore 自然重下 final
   cli.py         参数 → 调用的翻译层，不含业务逻辑
 tests/           零真实网络依赖，全量 ~10s
 ```

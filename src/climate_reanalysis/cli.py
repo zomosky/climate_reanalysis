@@ -22,6 +22,7 @@ from climate_reanalysis.download import (
 from climate_reanalysis.logging_setup import configure, get_logger
 from climate_reanalysis.migrate import stamp_legacy
 from climate_reanalysis.period import ready_months
+from climate_reanalysis.refresh import refresh
 from climate_reanalysis.restore import scan_once
 from climate_reanalysis.settings import load_settings
 from climate_reanalysis.variables import VAR_SPECS
@@ -102,6 +103,31 @@ def cmd_cleanup_jobs(args) -> int:
     return 0
 
 
+def cmd_refresh(args) -> int:
+    """把过期的 ERA5T 月份（expver 仍含初步标记 "0005"、且已过换新窗口）的
+    manifest 删掉，交给下一轮 download + restore 自然重下 final。危险操作
+    （会触发真实重下，代价是排队时间和带宽）——形态照 ``cleanup-jobs`` 的
+    范式，默认 dry-run，只有显式 ``--yes`` 才真正删除。
+
+    ``refresh()`` 本身就同时承担"预览"和"执行"两种模式（``execute`` 参数），
+    这里直接按 ``--yes`` 传下去，不必像 ``cleanup-jobs`` 那样另起一个专门的
+    预览函数。
+    """
+    s = load_settings(args.config)
+    today = dt.date.fromisoformat(args.today) if args.today else dt.date.today()
+    after_days = args.after_days if args.after_days is not None else s.refresh_after_days
+    got = refresh(s.store_dir, s.manifest_dir, today, after_days, execute=args.yes)
+    for month, var in got:
+        log.info("refresh_item", month=month, var=var)
+    if not args.yes:
+        log.info("refresh_dry_run", total=len(got),
+                 hint="预览模式，未删除任何 manifest；加 --yes 才会真正执行")
+    else:
+        log.info("refresh_done", count=len(got),
+                 hint="manifest 已删除；需要再跑一次 download + restore 才会真正重下 final")
+    return 0
+
+
 def cmd_list_variables(args) -> int:
     for name, spec in VAR_SPECS.items():
         print(f"{name:7s} {spec.units:10s} {spec.step_type:8s} <- {', '.join(spec.cds)}")
@@ -150,6 +176,20 @@ def main(argv=None) -> int:
         "不做任何实际删除——默认行为，账号级清理不可撤销、敲错即刻生效"
     ))
     cj.set_defaults(func=cmd_cleanup_jobs)
+
+    rf = sub.add_parser("refresh", help=(
+        "把过期 ERA5T 月份（expver 仍含初步标记）的 manifest 删掉，让下一轮 "
+        "download + restore 自然重下 final（危险，会触发真实重下；默认 "
+        "dry-run 只预览，加 --yes 才真删）"
+    ))
+    rf.add_argument("--today", help="覆盖“今天”（YYYY-MM-DD），用于测试换新窗口判据")
+    rf.add_argument("--after-days", type=int, default=None,
+                    help="留空 = 配置里的 refresh_after_days（出厂 100）")
+    rf.add_argument("--yes", action="store_true", help=(
+        "真正删除 manifest；不加则只打印将要刷新的 (月, 变量) 清单，不删任何"
+        "文件——默认行为，删 manifest 会触发真实重下，代价是排队时间和带宽"
+    ))
+    rf.set_defaults(func=cmd_refresh)
 
     lv = sub.add_parser("list-variables", help="列出产出变量与其 CDS 来源")
     lv.set_defaults(func=cmd_list_variables)

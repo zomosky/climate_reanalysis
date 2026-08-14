@@ -54,8 +54,8 @@ def test_archivable_when_restore_is_done(tmp_path: Path):
 
 def test_dry_run_moves_nothing(tmp_path: Path):
     md, sd, cd, raw = _setup(tmp_path)
-    moved, _ = archive(md, sd, cd)          # execute 默认 False
-    assert moved == 1                        # 报告「将搬 1 个」
+    r = archive(md, sd, cd)                  # execute 默认 False
+    assert r.moved == 1                      # 报告「将搬 1 个」
     assert raw.exists() and not cd.exists()  # 但一个都没动
 
 
@@ -115,8 +115,8 @@ def test_dry_run_does_not_require_cold_sentinel(tmp_path: Path):
     """预览不触碰文件系统，不必强制要求已挂载——只有真正要写盘（execute=True）
     时才需要哨兵确认。"""
     md, sd, cd, raw = _setup(tmp_path)   # cd 未创建、也没有哨兵
-    moved, skipped = archive(md, sd, cd)   # execute 默认 False，不应报错
-    assert moved == 1 and skipped == 0
+    r = archive(md, sd, cd)                # execute 默认 False，不应报错
+    assert r.moved == 1 and r.already == 0 and r.failed == 0
 
 
 def test_archive_twice_recognizes_already_archived_without_crashing(tmp_path: Path):
@@ -124,13 +124,13 @@ def test_archive_twice_recognizes_already_archived_without_crashing(tmp_path: Pa
     识别为"已归档，跳过"，不能对着不存在的热端文件再拷贝一次而崩溃、拖累
     这一整轮里排在它后面的其它 manifest。"""
     md, sd, cd, raw = _setup(tmp_path, mount_cold=True)
-    moved1, skipped1 = archive(md, sd, cd, execute=True)
-    assert moved1 == 1 and skipped1 == 0
+    r1 = archive(md, sd, cd, execute=True)
+    assert r1.moved == 1 and r1.already == 0
     assert not raw.exists()
 
-    moved2, skipped2 = archive(md, sd, cd, execute=True)   # 不抛异常
-    assert moved2 == 0
-    assert skipped2 == 1
+    r2 = archive(md, sd, cd, execute=True)                 # 不抛异常
+    assert r2.moved == 0
+    assert r2.already == 1
 
 
 def test_dry_run_after_archiving_reports_already_archived_as_skipped_not_moved(
@@ -142,9 +142,10 @@ def test_dry_run_after_archiving_reports_already_archived_as_skipped_not_moved(
     archive(md, sd, cd, execute=True)          # 先真正归档一次
     assert not raw.exists()
 
-    moved, skipped = archive(md, sd, cd)        # 再跑一次预览（execute 默认 False）
-    assert moved == 0
-    assert skipped == 1
+    r = archive(md, sd, cd)                     # 再跑一次预览（execute 默认 False）
+    assert r.moved == 0
+    # 已归档是稳态，不是失败——分开数，否则 cron 会天天报警
+    assert r.already == 1 and r.failed == 0
 
 
 def test_copy_failure_leaves_no_orphan_tmp_and_does_not_abort_the_run(
@@ -161,8 +162,19 @@ def test_copy_failure_leaves_no_orphan_tmp_and_does_not_abort_the_run(
 
     monkeypatch.setattr(mod.shutil, "copy2", _boom)
 
-    moved, skipped = archive(md, sd, cd, execute=True)   # 不抛异常
+    r = archive(md, sd, cd, execute=True)                # 不抛异常
 
-    assert moved == 0 and skipped == 1
+    assert r.moved == 0 and r.failed == 1
     assert raw.exists()                      # 热端未动
     assert not list(cd.rglob("*.tmp"))       # 没有孤儿临时文件残留
+
+
+def test_already_archived_is_not_a_failure(tmp_path: Path):
+    """归档完成后的稳态必须与真失败分开——混成一个计数再据此返回非零退出码，
+    cron 会在归档完成之后每一轮都报警，真故障反而淹没在噪音里。"""
+    md, sd, cd, raw = _setup(tmp_path)
+    cd.mkdir(parents=True, exist_ok=True)
+    (cd / ".climate_reanalysis_cold").touch()
+    archive(md, sd, cd, execute=True)
+    r = archive(md, sd, cd, execute=True)
+    assert (r.moved, r.already, r.failed) == (0, 1, 0)

@@ -144,18 +144,20 @@ def cmd_archive(args) -> int:
     """
     s = load_settings(args.config)
     try:
-        moved, skipped = archive(s.manifest_dir, s.store_dir, s.cold_dir, execute=args.yes)
+        r = archive(s.manifest_dir, s.store_dir, s.cold_dir, execute=args.yes)
     except Exception as exc:  # noqa: BLE001 - 转成日志 + 非零退出码，不裸抛出 main()
         log.error("archive_failed", error=str(exc),
                  hint="检查 cold_dir 是否已配置、冷盘是否已挂载并放好哨兵文件"
                       "（见 README「冷存归档」一节）")
         return 2
     if not args.yes:
-        log.info("archive_dry_run", would_move=moved, skipped=skipped,
+        log.info("archive_dry_run", would_move=r.moved, already=r.already,
+                 failed=r.failed,
                  hint="预览模式，未搬动任何文件；加 --yes 才会真正执行")
         return 0
-    log.info("archive_done", moved=moved, skipped=skipped)
-    return 1 if skipped else 0
+    log.info("archive_done", moved=r.moved, already=r.already, failed=r.failed)
+    # 只有真失败才非零：already 是归档完成后的稳态，日日报警会淹掉真故障
+    return 1 if r.failed else 0
 
 
 def cmd_list_variables(args) -> int:

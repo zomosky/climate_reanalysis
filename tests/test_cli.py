@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import re
+
 from pathlib import Path
 
 import numpy as np
@@ -363,3 +365,28 @@ def test_archive_with_yes_moves_and_cleans_hot(tmp_path):
     assert not raw.exists()
     cold = cold_path(s.cold_dir, "202601", "2m_temperature.nc")
     assert cold.read_bytes() == body
+
+
+def test_archive_returns_zero_when_everything_is_already_archived(tmp_path, capsys):
+    """归档完成后的稳态必须是退出码 0。
+
+    这是 cron 视角唯一要紧的语义：archive 挂上定时任务后，绝大多数轮次都是
+    「该搬的都搬完了、无事可做」。若把这种稳态也当成非零退出，运维会天天收到
+    报警，久而久之就没人看了——真正的搬运失败反而被淹没。所以「已归档」与
+    「失败」必须走不同的退出码。
+    """
+    cfg = _settings_yaml_with_cold(tmp_path)
+    s = Settings(raw_dir=tmp_path / "raw", manifest_dir=tmp_path / "manifests",
+                store_dir=tmp_path / "store", cold_dir=tmp_path / "cold")
+    _archivable_month(s)
+    s.cold_dir.mkdir(parents=True, exist_ok=True)
+    (s.cold_dir / COLD_SENTINEL_NAME).touch()
+
+    assert cli.main(["--config", str(cfg), "archive", "--yes"]) == 0   # 第一轮真搬
+    capsys.readouterr()
+
+    rc = cli.main(["--config", str(cfg), "archive", "--yes"])          # 第二轮无事可做
+    assert rc == 0
+    # structlog 会在键与值之间插 ANSI 颜色码，先剥掉再断言
+    out = re.sub(r"\x1b\[[0-9;]*m", "", capsys.readouterr().out)
+    assert "already=1" in out and "failed=0" in out and "moved=0" in out

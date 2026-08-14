@@ -35,6 +35,7 @@ import hashlib
 import os
 import shutil
 from pathlib import Path
+from typing import NamedTuple
 
 from climate_reanalysis.logging_setup import get_logger
 from climate_reanalysis.manifest import iter_manifests, manifest_sha256, read_manifest
@@ -53,6 +54,18 @@ log = get_logger(__name__)
 
 #: 冷盘挂载点必须放着这个文件才允许归档写入——见 ``_require_cold_sentinel``。
 COLD_SENTINEL_NAME = ".climate_reanalysis_cold"
+
+
+class ArchiveOutcome(NamedTuple):
+    """归档结果。**``already`` 与 ``failed`` 必须分开数**——两者都「没搬成」，
+    含义却相反：``already`` 是稳态（该搬的都搬完了，日常 cron 的常态），
+    ``failed`` 才是要人看的。混成一个 ``skipped`` 再据此返回非零退出码，会让
+    归档完成之后每一轮 cron 都报警，真故障反而淹没在噪音里。
+    """
+
+    moved: int
+    already: int
+    failed: int
 
 
 class ColdDirNotMountedError(RuntimeError):
@@ -241,13 +254,14 @@ def archive(
 
     candidates = archivable(manifest_dir, store_dir)
     moved = 0
-    skipped = 0
+    already = 0
+    failed = 0
     for mf in candidates:
         try:
             d = read_manifest(mf)
             files = d["files"]
             if _already_archived(cold_dir, d["period"], files):
-                skipped += 1
+                already += 1
                 continue
             if not execute:
                 moved += len(files)
@@ -257,11 +271,11 @@ def archive(
                 log.info("archived", month=d["period"], var=d["variable"],
                          files=len(files))
             else:
-                skipped += 1
+                failed += 1
         except Exception as exc:  # noqa: BLE001 - 单份 manifest 失败不中断整轮
             log.error(
                 "archive_manifest_failed", manifest=str(mf), error=str(exc),
                 hint="这份 manifest 处理失败，已跳过，不影响其余 manifest",
             )
-            skipped += 1
-    return moved, skipped
+            failed += 1
+    return ArchiveOutcome(moved=moved, already=already, failed=failed)

@@ -18,6 +18,7 @@ ERA5 再分析的**持续积累**管线，与 `climate_pipeline` 里的 `downloa
 | `download` | 每（月 × 产出变量）一次 CDS 请求 → `raw/` + `manifests/`（唯一的就绪信号） |
 | `restore` | 幂等一趟扫描 manifest → 写进 `<YYYYMM>_era5.zarr`（可 cron） |
 | `migrate` | 给既有月库的历史变量打 legacy 溯源，使 restore 认为已就位，避免重下 |
+| `bake-legacy` | 一次性历史导入：把 `solarcast` 省级 20 年 tile 直接烘成月度国网库（见下方「历史导入（一次性烘焙）」） |
 
 ## 安装
 
@@ -275,6 +276,57 @@ touch /save_data/climate_data/era5/raw/.climate_reanalysis_cold
 这条自愈路径正是本功能存在的意义——冷存归档换来的不只是热盘空间，更是「月库
 出问题时不必重新排队几十小时 CDS 请求」这件事本身。
 
+## 历史导入（一次性烘焙）
+
+`ssrd`/`fdir`/`t2m`/`si10`/`sp` 等变量的 240 个历史月库最初不是从本项目下载出来
+的：早年 `solarcast` 项目按省下载了 20 年的省级 tile（`provinces_multiyear/<省
+代码>.zarr`，供光伏发电量测算用，变量名随 pvlib、时间戳搬到区间中点 :30），
+再用一套「烘焙」代码把这些 tile 拼成 ERA5 原生整点轴、ECMWF 变量名的月度国网库
+——即本项目 `store.py` 的产出契约。
+
+`bake-legacy` 子命令就是这套烘焙代码，从 `solarcast/scripts/bake_era5.py` +
+`solarcast/src/solarcast/rebake/` 搬进 `src/climate_reanalysis/legacy_bake/`。
+**这条路径以后用不上**：本项目的持续积累已经改为逐月直接从 CDS 下载
+（`download` + `restore` 两个单元），不再需要省级 tile 这个中间形态；保留它
+只是因为烘焙属于数据处理，而数据处理现在全部收拢在 `climate_reanalysis`
+里——`solarcast` 以后只消费月度国网库，不再生产它。
+
+```bash
+# 冒烟（两个相邻省，有 buffer 重叠）
+uv run climate_reanalysis bake-legacy --tiles /path/to/provinces_multiyear \
+    --months 200501
+
+# 全量（240 个月，分片优先遍历，账本可断点续跑；--out 留空 = settings.store_dir）
+uv run climate_reanalysis bake-legacy --tiles data/provinces_multiyear \
+    --months $(python3 -c "print(' '.join(f'{y}{m:02d}' for y in range(2005,2025) for m in range(1,13)))")
+
+# 增量加变量（补下 u100/v100/d2m 之后，只跑新变量那一列）
+uv run climate_reanalysis bake-legacy --tiles data/provinces_multiyear \
+    --months 200501 --variables u100 v100 d2m
+```
+
+`--out` 留空时取 `settings.store_dir`——这正是收拢的意义：档案位置由项目配置
+统一管，不必像原来的独立脚本那样每次手敲绝对路径。`--ledger` 同样留空时取
+`<out>/_ledger.json`，记录 `(月, 变量, 分片)` 三元组的完成状态，中断后重跑会
+跳过已完成的部分；补下新 tile（省份/变量）后账本按 tile 集合指纹自动整体
+作废、全量重烘（避免补下的数据悄悄不进库、且不报错）。`bake-legacy` 全程只读
+本地 tile、只写本地 zarr，不发起任何网络请求。
+
+**网格常量不重复定义**：`legacy_bake/grid.py` 的 `TARGET_LAT`/`TARGET_LON`/
+`SHARD`/`CHUNK` 直接从 `store.py` import（迁移前已用 `np.array_equal` 核对过
+两处历史定义逐值相同），保证 `bake-legacy` 烘出来的网格与 `download` →
+`restore` 那条路径产出的月库**逐格一致**——这两份原本独立维护的真值一旦漂移，
+后果是网格对不上且没有任何报错，故收拢成一份，`tests/test_legacy_bake_grid.py`
+有专门的一致性用例钉死。
+
+**`bake-legacy` 与 `migrate` 的分工不同**：`bake-legacy` 从省级 tile 生成月库
+的**实际数据**（写入 `ssrd`/`t2m` 等数组本身）；`migrate` 假定数据已经在库里
+（不管是 `bake-legacy` 烘出来的，还是更早年用 solarcast 里的脚本烘的），只补
+一条**溯源标记**，让 `restore` 认得这些月份已经就位、不会被误判成"从未处理"
+而重新触发真实 CDS 下载。已经跑过一次历史烘焙（`.zarr` 已在 `store_dir` 下）
+的机器上，通常只需要 `migrate`；只有月库本身缺失、需要从省级 tile 重新生成
+时才需要 `bake-legacy`。
+
 ## 历史迁移（一次性）
 
 现有历史月库（`solarcast` 一次性烘焙的 240 个月，`ssrd`/`fdir`/`t2m`/`si10`/`sp` 等
@@ -411,6 +463,10 @@ src/climate_reanalysis/
   refresh.py     ERA5T 刷新：删过期月份的 manifest + 原始文件，交给 download+restore 自然重下 final
   archive.py     冷存归档：下游已固化才搬、逐文件 sha 校验、先搬后删、要求冷盘挂载哨兵
   paths.py       cold_path()：archive/restore/refresh 三边共用的冷端路径拼接，不依赖任何单元
+  legacy_bake/   一次性历史导入：省级 tile → 月度国网库（搬自 solarcast/rebake，见「历史导入」一节）
+    grid.py        目标网格常量（从 store.py import，不重复定义）、tile 落位、烘焙账本
+    deconv.py      中点化（:30）反解回 ERA5 原生整点轴
+    bake.py        遍历分片 × 变量，把 tile 数据换算、写入月库
   cli.py         参数 → 调用的翻译层，不含业务逻辑
 tests/           零真实网络依赖，全量 ~10s
 ```

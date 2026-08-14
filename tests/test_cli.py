@@ -230,6 +230,71 @@ def test_migrate_stamps_store_and_restore_then_leaves_it_alone(tmp_path):
     assert read_provenance(s.store_dir, "202601")["ssrd"]["source"] == "legacy:x"
 
 
+def test_bake_legacy_defaults_out_to_store_dir(tmp_path, monkeypatch):
+    """--out 留空时取 settings.store_dir——把数据处理收拢进本项目的意义就是
+    档案位置由项目配置统一管，不必每次手敲路径。"""
+    cfg = _settings_yaml(tmp_path)
+    s = Settings(raw_dir=tmp_path / "raw", manifest_dir=tmp_path / "manifests",
+                store_dir=tmp_path / "store")
+    tiles_dir = tmp_path / "tiles"
+    tiles_dir.mkdir()
+    (tiles_dir / "110000.zarr").mkdir()  # 假 tile，只需要能被 glob 到
+
+    captured = {}
+
+    def fake_bake(tiles, out_root, months, ledger, variables=None, hours=None):
+        captured["out_root"] = Path(out_root)
+        captured["months"] = months
+        captured["tiles"] = [Path(t) for t in tiles]
+        captured["variables"] = variables
+
+    monkeypatch.setattr("climate_reanalysis.cli.run_legacy_bake", fake_bake)
+
+    rc = cli.main(["--config", str(cfg), "bake-legacy", "--tiles", str(tiles_dir),
+                  "--months", "202601"])
+
+    assert rc == 0
+    assert captured["out_root"] == s.store_dir
+    assert captured["months"] == ["202601"]
+    assert captured["tiles"] == [tiles_dir / "110000.zarr"]
+    assert captured["variables"] is None
+
+
+def test_bake_legacy_explicit_out_overrides_store_dir(tmp_path, monkeypatch):
+    cfg = _settings_yaml(tmp_path)
+    tiles_dir = tmp_path / "tiles"
+    tiles_dir.mkdir()
+    (tiles_dir / "110000.zarr").mkdir()
+    out_dir = tmp_path / "elsewhere"
+
+    captured = {}
+    monkeypatch.setattr(
+        "climate_reanalysis.cli.run_legacy_bake",
+        lambda tiles, out_root, months, ledger, variables=None, hours=None:
+            captured.update(out_root=Path(out_root)),
+    )
+
+    rc = cli.main(["--config", str(cfg), "bake-legacy", "--tiles", str(tiles_dir),
+                  "--months", "202601", "--out", str(out_dir), "--variables", "t2m"])
+
+    assert rc == 0
+    assert captured["out_root"] == out_dir
+
+
+def test_bake_legacy_rejects_empty_tiles_dir_without_calling_bake(tmp_path, monkeypatch):
+    """tile 目录下没有任何 .zarr——响亮失败，绝不能悄悄跑一次"什么都没烘"就
+    返回 0（那会让人误以为历史导入已经完成）。"""
+    cfg = _settings_yaml(tmp_path)
+    empty_dir = tmp_path / "empty_tiles"
+    empty_dir.mkdir()
+
+    monkeypatch.setattr("climate_reanalysis.cli.run_legacy_bake", _forbid_network)
+
+    rc = cli.main(["--config", str(cfg), "bake-legacy", "--tiles", str(empty_dir),
+                  "--months", "202601"])
+    assert rc != 0
+
+
 def _stale_era5t_month(tmp_path: Path, s: Settings) -> None:
     """造一个「过期未换新」的月份：月库溯源记着仍是初步值，且已有对应 manifest
     （模拟当初 download 真的跑过一次）。"""

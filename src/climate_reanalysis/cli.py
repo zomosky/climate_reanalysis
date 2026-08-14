@@ -20,6 +20,8 @@ from climate_reanalysis.download import (
     download_many,
     preview_account_failed_jobs,
 )
+from climate_reanalysis.legacy_bake.bake import bake as run_legacy_bake
+from climate_reanalysis.legacy_bake.grid import Ledger, tiles_fingerprint
 from climate_reanalysis.logging_setup import configure, get_logger
 from climate_reanalysis.migrate import stamp_legacy
 from climate_reanalysis.period import ready_months
@@ -73,6 +75,28 @@ def cmd_migrate(args) -> int:
     s = load_settings(args.config)
     n = stamp_legacy(s.store_dir, args.months, args.variables, args.tag)
     log.info("migrate_done", stamped=n)
+    return 0
+
+
+def cmd_bake_legacy(args) -> int:
+    """一次性历史导入：把 solarcast 省级 tile 烘成月度国网库，替代原来在
+    solarcast 里的 ``scripts/bake_era5.py``。业务逻辑全在
+    ``climate_reanalysis.legacy_bake`` 里，这里只做参数翻译——其中
+    ``--out`` 默认取 ``settings.store_dir``，不再要求每次手敲输出路径，
+    这正是把数据处理收拢进本项目的意义：档案位置由项目配置统一管。
+    """
+    s = load_settings(args.config)
+    out_root = args.out or s.store_dir
+    tiles = sorted(Path(args.tiles).glob("*.zarr"))
+    if not tiles:
+        log.error("bake_legacy_no_tiles", tiles_dir=str(args.tiles))
+        return 2
+    ledger_path = args.ledger or (Path(out_root) / "_ledger.json")
+    ledger = Ledger.load(ledger_path, tiles_fingerprint(tiles))
+    log.info("bake_legacy_start", tiles=len(tiles), out=str(out_root),
+             months=len(args.months), variables=args.variables or "all")
+    run_legacy_bake(tiles, out_root, args.months, ledger, args.variables)
+    log.info("bake_legacy_done", months=len(args.months))
     return 0
 
 
@@ -197,6 +221,23 @@ def main(argv=None) -> int:
     m.add_argument("--variables", nargs="+", required=True)
     m.add_argument("--tag", default="legacy:solarcast-bake")
     m.set_defaults(func=cmd_migrate)
+
+    bl = sub.add_parser("bake-legacy", help=(
+        "一次性历史导入：把 solarcast 省级 20 年 tile 烘成月度国网库（替代 "
+        "solarcast/scripts/bake_era5.py；持续积累已改为逐月直下 CDS，这条"
+        "路径只在补历史时才用得到）"
+    ))
+    bl.add_argument("--tiles", required=True, type=Path, help="省级 tile 目录（*.zarr）")
+    bl.add_argument("--months", nargs="+", required=True, help="YYYYMM ...")
+    bl.add_argument("--variables", nargs="*", default=None,
+                    help="留空 = 全部；指定则只跑这几个（增量加变量）")
+    bl.add_argument("--out", type=Path, default=None, help=(
+        "月度国网库输出目录；留空 = settings.store_dir（收拢默认档案位置，"
+        "不必每次手敲路径）"
+    ))
+    bl.add_argument("--ledger", type=Path, default=None,
+                    help="留空 = <out>/_ledger.json")
+    bl.set_defaults(func=cmd_bake_legacy)
 
     cj = sub.add_parser("cleanup-jobs", help=(
         "账号级清理全部失败/被拒 job（危险，不限本批——独立入口，别挂进日常"

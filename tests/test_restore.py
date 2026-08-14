@@ -229,6 +229,45 @@ def test_rebuild_falls_back_to_cold_copy(tmp_path: Path):
     np.testing.assert_allclose(ds["ssrd"].values[0, 0, 0], 1.0)   # 3600/3600
 
 
+def test_cold_fallback_logs_which_month_var_file(tmp_path: Path, capsys):
+    """走冷端回退这件事必须出声——"已归档所以走冷端"和"热端被误 rm"两种情况
+    在日志里必须能区分，一次误删才不会被静默兜住、永远没人发现。"""
+    month, cds = "202601", "surface_solar_radiation_downwards"
+    s = Settings(raw_dir=tmp_path / "raw", manifest_dir=tmp_path / "m",
+                store_dir=tmp_path / "s", cold_dir=tmp_path / "cold")
+    f = make_raw_nc(s.raw_dir / month / f"{cds}.nc", month, cds, 3600.0)
+    mf = write_manifest(s.manifest_dir, month, "ssrd", [f], AREA)
+    cold = cold_path(s.cold_dir, month, f.name)
+    cold.parent.mkdir(parents=True)
+    cold.write_bytes(f.read_bytes())
+    f.unlink()
+
+    assert restore_one(s, mf) == "done"
+
+    out = capsys.readouterr().out
+    assert "restore_cold_fallback" in out
+    assert month in out
+    assert f.name in out
+
+
+def test_cold_copy_sha_mismatch_is_rejected_not_silently_written(tmp_path: Path):
+    """冷端副本可能在冷盘上放好几年，恰恰是最该验的一份——manifest 里现成
+    记着 sha256，必须校验，不符就报错，不能把坏数据静默切进月库。"""
+    month, cds = "202601", "surface_solar_radiation_downwards"
+    s = Settings(raw_dir=tmp_path / "raw", manifest_dir=tmp_path / "m",
+                store_dir=tmp_path / "s", cold_dir=tmp_path / "cold")
+    f = make_raw_nc(s.raw_dir / month / f"{cds}.nc", month, cds, 3600.0)
+    mf = write_manifest(s.manifest_dir, month, "ssrd", [f], AREA)
+    cold = cold_path(s.cold_dir, month, f.name)
+    cold.parent.mkdir(parents=True)
+    cold.write_bytes(b"this-is-not-the-real-file-content-at-all")   # 冷端副本已损坏
+    f.unlink()
+
+    with pytest.raises(ValueError, match="sha"):
+        restore_one(s, mf)
+    assert not store_path(s.store_dir, month).exists()
+
+
 def test_missing_raw_without_cold_dir_raises(tmp_path: Path):
     """cold_dir 未配置（出厂 None）时行为不变——热端缺失直接报错，不会误报
     "成功"，也不会因为新逻辑而意外吞掉这种缺失。"""

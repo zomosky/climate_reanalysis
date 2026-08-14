@@ -117,7 +117,8 @@ def cmd_refresh(args) -> int:
     s = load_settings(args.config)
     today = dt.date.fromisoformat(args.today) if args.today else dt.date.today()
     after_days = args.after_days if args.after_days is not None else s.refresh_after_days
-    got = refresh(s.store_dir, s.manifest_dir, today, after_days, execute=args.yes)
+    got = refresh(s.store_dir, s.manifest_dir, today, after_days, execute=args.yes,
+                  cold_dir=s.cold_dir)
     for month, var in got:
         log.info("refresh_item", month=month, var=var)
     if not args.yes:

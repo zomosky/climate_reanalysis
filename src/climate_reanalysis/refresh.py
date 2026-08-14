@@ -1,13 +1,29 @@
 """ERA5T 刷新：把过期的初步数据（expver=0005）换成 final（expver=0001）。
 
-**只删 manifest，绝不碰月库数据**——这是刻意的设计，不是偷懒。管线的两个单元
-（download 写 manifest、restore 读 manifest 切库）只通过 manifest 通信，这是
-它们之间唯一的契约；`refresh` 不去教 download 认得月库结构，只是把过期月份的
-manifest 删掉，让既有的 download → restore 流程自然把它们当成"没下过"重新走
-一遍——sha 天然对不上，restore 自动重建，两个单元本身零改动。
+**绝不碰月库数据**——这是刻意的设计，不是偷懒。管线的两个单元（download 写
+manifest、restore 读 manifest 切库）只通过 manifest 通信，这是它们之间唯一的
+契约；`refresh` 不去教 download 认得月库结构，只是把过期月份的 manifest（连同
+对应的原始文件）删掉，让既有的 download → restore 流程自然把它们当成"没下过"
+重新走一遍——sha 天然对不上，restore 自动重建，两个单元本身零改动。
 
-真正的重下发生在**下一次** `download` + `restore`，`refresh` 自己不联网、不写
-任何新文件，只做"清单预览"和"删 manifest"两件事。
+**必须连原始文件（raw，热端 + 冷端）一起删，不能只删 manifest**：`download_one`
+判断"这个 (月×变量) 还需不需要真的发请求"分两层——manifest 存在就整体早退，
+manifest 不存在则逐 CDS 变量看 `target.exists()`（热端 raw 在不在）决定要不要
+调用 `retrieve`。只删 manifest 的话，第二层缓存判据原封不动地命中同一份过期
+raw 文件，`download_one` 会在**零网络请求**的情况下把这份旧文件原样重新写进
+manifest（`completed_at` 变了，sha 因此也变，看起来像是"处理过"），
+`restore` 因此重建出跟之前一模一样的初步数据——`refresh` 于是变成一次
+"空转"：日志照常打 `refresh_done`，但 `expver` 永远还是 `0005`，永远刷不动。
+ERA5T 月份恰恰是**最不可能已经归档**的最近月份，这条空转会命中几乎全部目标。
+
+删除顺序**先 raw（热端 + 冷端）、最后 manifest**，不能反过来：manifest 存在
+是"这份数据已完整"的信号，它最后消失，中途崩溃时留下的是"manifest 在但 raw
+没了"——这个状态下 `restore` 只要月库溯源还在就照常跳过，无害；反过来先删
+manifest 会留下一个无主的 raw 文件（既不被任何 manifest 引用，也不会被当前
+的 `download_one` 缓存判据用到，纯粹是垃圾）。
+
+真正的重下发生在**下一次** `download` + `restore`，`refresh` 自己不联网、只在
+`execute=True` 时才写（删）文件，`execute=False`（默认）只做"清单预览"。
 """
 
 from __future__ import annotations
@@ -15,8 +31,9 @@ from __future__ import annotations
 import datetime as dt
 from pathlib import Path
 
+from climate_reanalysis.archive import cold_path
 from climate_reanalysis.logging_setup import get_logger
-from climate_reanalysis.manifest import manifest_path
+from climate_reanalysis.manifest import manifest_path, read_manifest
 from climate_reanalysis.store import read_provenance
 
 log = get_logger(__name__)
@@ -85,13 +102,21 @@ def refresh(
     today: dt.date,
     after_days: int,
     execute: bool = False,
+    cold_dir: Path | None = None,
 ) -> list[tuple[str, str]]:
-    """把过期 ERA5T 月份的 manifest 删掉，交给下一轮 download + restore 重下。
+    """把过期 ERA5T 月份的 manifest**连同原始文件**删掉，交给下一轮
+    download + restore 重下。
 
     ``execute=False``（默认）只返回将要刷新的清单，**不删任何文件**——删
-    manifest 会触发真实重下，代价是排队时间和带宽，必须先看清楚清单再决定。
-    ``execute=True`` 才真正删除，且只删 manifest 本身，绝不碰月库数据本身
-    （重建交给后续 restore 按 sha 不符自然触发，不在这里抢它的活）。
+    manifest 与 raw 会触发真实重下，代价是排队时间和带宽，必须先看清楚清单
+    再决定。``execute=True`` 才真正删除，且**只删 manifest 与 raw 这两类
+    "重下即可再生"的文件**，绝不碰月库数据本身（重建交给后续 restore 按 sha
+    不符自然触发，不在这里抢它的活）。
+
+    删除顺序：**先 raw（热端 + 若配置了 cold_dir 则连冷端也删），最后才删
+    manifest**——manifest 是"这份数据已完整下载"的信号，必须最后消失，理由
+    见模块顶部 docstring。``cold_dir`` 为 ``None``（未配置归档）时不做任何
+    冷端相关操作，只删热端 raw，行为与未接入冷存归档之前一致。
 
     对应 manifest 本就不存在的 (月, 变量)（例如只打过 legacy 标记、从未真正
     走过 download 的历史月）静默跳过，不计入"实际删除"的返回值，也不报错——
@@ -106,6 +131,19 @@ def refresh(
         if not p.exists():
             log.warning("refresh_manifest_missing", month=month, var=var, path=str(p))
             continue
+        d = read_manifest(p)
+        for f in d["files"]:
+            hot = Path(f["path"])
+            if hot.exists():
+                hot.unlink()
+            if cold_dir is not None:
+                cold = cold_path(Path(cold_dir), month, hot.name)
+                if cold.exists():
+                    cold.unlink()
+        # manifest 最后删——它是"已完整下载"的信号，raw 没删完之前它必须还在，
+        # 中途崩溃时留下"manifest 在但 raw 已删一部分"仍是无害状态（restore
+        # 靠月库溯源判断，不看 raw 存不存在），反过来先删 manifest 会留下
+        # 无主的 raw 文件
         p.unlink()
         deleted.append((month, var))
     return deleted

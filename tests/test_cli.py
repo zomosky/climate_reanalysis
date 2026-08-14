@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 
 from climate_reanalysis import cli
-from climate_reanalysis.archive import cold_path
+from climate_reanalysis.archive import COLD_SENTINEL_NAME, cold_path
 from climate_reanalysis.manifest import manifest_path, manifest_sha256, write_manifest
 from climate_reanalysis.settings import Settings
 from climate_reanalysis.store import ensure_store, read_provenance, set_provenance, write_variable
@@ -331,6 +331,10 @@ def test_archive_with_yes_moves_and_cleans_hot(tmp_path):
                 store_dir=tmp_path / "store", cold_dir=tmp_path / "cold")
     raw = _archivable_month(s)
     body = raw.read_bytes()
+    # execute=True 起要求冷盘已挂载确认（哨兵文件）——见 archive.py 的
+    # ColdDirNotMountedError；这里模拟"已确认挂载"。
+    s.cold_dir.mkdir(parents=True)
+    (s.cold_dir / COLD_SENTINEL_NAME).touch()
 
     rc = cli.main(["--config", str(cfg), "archive", "--yes"])
 

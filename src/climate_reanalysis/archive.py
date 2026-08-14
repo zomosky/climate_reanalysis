@@ -42,6 +42,45 @@ from climate_reanalysis.store import read_provenance
 
 log = get_logger(__name__)
 
+#: 冷盘挂载点必须放着这个文件才允许归档写入——见 ``_require_cold_sentinel``。
+COLD_SENTINEL_NAME = ".climate_reanalysis_cold"
+
+
+class ColdDirNotMountedError(RuntimeError):
+    """冷盘目录未通过挂载确认（不存在 / 不是目录 / 缺哨兵文件）。
+
+    挂载点在没挂载时，宿主机上通常表现为一个**存在、可写的空目录**（挂载失败
+    本身不报错，只是没有内容）——单纯判断"目录是否存在"挡不住这种情况：会在
+    冷盘没挂上的时候，把整棵冷端目录树建在热盘（或根盘）上，拷贝、校验（同
+    一块盘，天然全部一致）、然后删掉热端；等真正的冷盘挂上，这份"冷端副本"
+    被挂载点遮蔽，restore 回退时两边都找不到——热端已删、冷端不可用，数据
+    就丢了。哨兵文件是运维在**确认挂载之后**手动放的信号，纯代码判断不出
+    "挂载"这件事，只能靠这个信号替代。
+    """
+
+
+def _require_cold_sentinel(cold_dir: Path) -> None:
+    """归档写入前的强制前置条件：``cold_dir`` 必须已经存在、是目录、且其下
+    有哨兵文件 ``COLD_SENTINEL_NAME``。只允许在它下面建月份子目录（
+    ``cold_path(...).parent.mkdir(parents=True, ...)``），绝不允许把
+    ``cold_dir`` 本身建出来——这里提前拒绝就是为了保证那一步的 ``mkdir``
+    永远只会创建月份子目录。
+    """
+    if not cold_dir.is_dir():
+        raise ColdDirNotMountedError(
+            f"冷盘目录不存在或不是目录：{cold_dir}——归档拒绝执行。这通常意味着"
+            "冷盘还没挂载（未挂载时该路径可能干脆不存在），也可能是 cold_dir "
+            "配置写错了。确认冷盘已挂载、路径正确后重试"
+        )
+    sentinel = cold_dir / COLD_SENTINEL_NAME
+    if not sentinel.exists():
+        raise ColdDirNotMountedError(
+            f"冷盘目录 {cold_dir} 下缺少哨兵文件 {COLD_SENTINEL_NAME}——归档拒绝"
+            "执行。挂载点在未挂载时通常仍表现为一个存在的空目录，只判断目录"
+            "存在挡不住误把数据搬到热盘上再删掉热端这个风险。确认冷盘确已"
+            f"挂载后执行：touch {sentinel}"
+        )
+
 
 def cold_path(cold_dir: Path, month: str, name: str) -> Path:
     """冷端某个原始文件应落盘的位置——布局与 ``raw_dir/<month>/<name>`` 同构，
@@ -151,6 +190,10 @@ def archive(
 
     ``cold_dir=None`` 一律拒绝执行（哪怕只是预览）并抛错：出厂就是未配置，
     不给任何看似无害的默认路径，本机/测试环境通常没有那块盘。
+
+    ``execute=True`` 时额外要求 ``cold_dir`` 通过 ``_require_cold_sentinel``
+    的挂载确认——预览不写盘，不强制要求；真正要写盘（会在冷盘没挂载时把
+    目录树建到热盘上）之前必须确认过。
     """
     if cold_dir is None:
         raise ValueError(
@@ -158,6 +201,8 @@ def archive(
             "冷盘归档根目录（服务器示例见 README「冷存归档」一节）"
         )
     cold_dir = Path(cold_dir)
+    if execute:
+        _require_cold_sentinel(cold_dir)
 
     candidates = archivable(manifest_dir, store_dir)
     moved = 0

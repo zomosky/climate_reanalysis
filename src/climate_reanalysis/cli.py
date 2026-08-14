@@ -13,6 +13,7 @@ import datetime as dt
 import sys
 from pathlib import Path
 
+from climate_reanalysis.archive import archive
 from climate_reanalysis.cds import make_client
 from climate_reanalysis.download import (
     cleanup_account_failed_jobs,
@@ -128,6 +129,23 @@ def cmd_refresh(args) -> int:
     return 0
 
 
+def cmd_archive(args) -> int:
+    """把已固化（月库溯源 sha 与当前 manifest 一致）的原始文件搬到冷盘、清出
+    热盘，形态照 ``refresh``/``cleanup-jobs`` 的范式——默认 dry-run，只有
+    显式 ``--yes`` 才真正搬运并清理热端。危险操作的另一面：这一步执行完，
+    对应原始文件在热盘上就不存在了，只能靠冷端 + `restore` 自愈路径找回，
+    不像 ``refresh``/``cleanup-jobs`` 删的是可重新生成的东西。
+    """
+    s = load_settings(args.config)
+    moved, skipped = archive(s.manifest_dir, s.store_dir, s.cold_dir, execute=args.yes)
+    if not args.yes:
+        log.info("archive_dry_run", would_move=moved, skipped=skipped,
+                 hint="预览模式，未搬动任何文件；加 --yes 才会真正执行")
+        return 0
+    log.info("archive_done", moved=moved, skipped=skipped)
+    return 1 if skipped else 0
+
+
 def cmd_list_variables(args) -> int:
     for name, spec in VAR_SPECS.items():
         print(f"{name:7s} {spec.units:10s} {spec.step_type:8s} <- {', '.join(spec.cds)}")
@@ -190,6 +208,17 @@ def main(argv=None) -> int:
         "文件——默认行为，删 manifest 会触发真实重下，代价是排队时间和带宽"
     ))
     rf.set_defaults(func=cmd_refresh)
+
+    ar = sub.add_parser("archive", help=(
+        "把已固化（月库溯源 sha 与当前 manifest 一致）的原始文件搬到冷盘、"
+        "清出热盘（危险，热端会被删；默认 dry-run 只统计，加 --yes 才真搬）"
+    ))
+    ar.add_argument("--yes", action="store_true", help=(
+        "真正执行搬运（逐文件拷冷端、校验 sha、确认无误后才删热端）；不加"
+        "则只统计将搬走的文件数与跳过的 manifest 数，不动任何文件——默认"
+        "行为，归档会清空热端原始文件"
+    ))
+    ar.set_defaults(func=cmd_archive)
 
     lv = sub.add_parser("list-variables", help="列出产出变量与其 CDS 来源")
     lv.set_defaults(func=cmd_list_variables)

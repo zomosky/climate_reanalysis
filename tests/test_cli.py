@@ -9,7 +9,8 @@ import numpy as np
 import pytest
 
 from climate_reanalysis import cli
-from climate_reanalysis.manifest import manifest_path, write_manifest
+from climate_reanalysis.archive import cold_path
+from climate_reanalysis.manifest import manifest_path, manifest_sha256, write_manifest
 from climate_reanalysis.settings import Settings
 from climate_reanalysis.store import ensure_store, read_provenance, set_provenance, write_variable
 from climate_reanalysis.variables import VAR_SPECS
@@ -27,6 +28,34 @@ def _settings_yaml(tmp_path: Path) -> Path:
         "raw_dir: raw\nmanifest_dir: manifests\nstore_dir: store\n", encoding="utf-8"
     )
     return cfg
+
+
+def _settings_yaml_with_cold(tmp_path: Path) -> Path:
+    """同 ``_settings_yaml``，多配一个 ``cold_dir``——archive 命令出厂拒绝
+    未配置冷盘的情况，需要单独一份配置样例覆盖"已配置"的路径。"""
+    cfg_dir = tmp_path / "config"
+    cfg_dir.mkdir()
+    cfg = cfg_dir / "settings.yaml"
+    cfg.write_text(
+        "raw_dir: raw\nmanifest_dir: manifests\nstore_dir: store\ncold_dir: cold\n",
+        encoding="utf-8",
+    )
+    return cfg
+
+
+def _archivable_month(s: Settings) -> Path:
+    """造一份「下游已固化」的 (月×变量)：raw 文件存在，月库溯源的
+    ``manifest_sha256`` 与该 manifest 当前 sha 一致——``archivable()`` 判据
+    通过。原始内容用任意字节即可，archive 只做文件级拷贝+sha 校验，不解析
+    netCDF。"""
+    raw = s.raw_dir / "202601" / "2m_temperature.nc"
+    raw.parent.mkdir(parents=True, exist_ok=True)
+    raw.write_bytes(b"payload" * 100)
+    mf = write_manifest(s.manifest_dir, "202601", "t2m", [raw], _AREA)
+    ensure_store(s.store_dir, "202601")
+    set_provenance(s.store_dir, "202601", "t2m",
+                   {"manifest_sha256": manifest_sha256(mf)})
+    return raw
 
 
 def test_list_variables_prints_all_output_vars(capsys):
@@ -262,3 +291,50 @@ def test_refresh_after_days_overrides_config_default(tmp_path):
                   "--after-days", "10", "--yes"])
     assert rc == 0
     assert not manifest_path(s.manifest_dir, "202601", "t2m").exists()
+
+
+def test_archive_requires_cold_dir_configured(tmp_path):
+    """cold_dir 出厂 None——归档命令必须拒绝执行并报错，不给一个看似无害的
+    默认路径悄悄搬走原始文件（本机/多数环境根本没有那块盘）。"""
+    cfg = _settings_yaml(tmp_path)   # 没有配 cold_dir
+    with pytest.raises(ValueError):
+        cli.main(["--config", str(cfg), "archive"])
+
+
+def test_archive_on_empty_manifest_dir_is_a_noop(tmp_path):
+    cfg = _settings_yaml_with_cold(tmp_path)
+    assert cli.main(["--config", str(cfg), "archive"]) == 0
+
+
+def test_archive_defaults_to_dry_run_and_deletes_nothing(tmp_path, capsys):
+    """归档会清空热端原始文件，代价很实在——不加 --yes 必须是纯统计，一个
+    文件都不能动，哪怕确实有已固化的 (月×变量) 可搬。"""
+    cfg = _settings_yaml_with_cold(tmp_path)
+    s = Settings(raw_dir=tmp_path / "raw", manifest_dir=tmp_path / "manifests",
+                store_dir=tmp_path / "store", cold_dir=tmp_path / "cold")
+    raw = _archivable_month(s)
+
+    rc = cli.main(["--config", str(cfg), "archive"])   # 不加 --yes
+
+    assert rc == 0
+    assert raw.exists()               # 一个都没动
+    assert not s.cold_dir.exists()    # 连冷端目录都没建
+    out = capsys.readouterr().out
+    assert "archive_dry_run" in out
+
+
+def test_archive_with_yes_moves_and_cleans_hot(tmp_path):
+    """--yes 才真正搬运：冷端内容与热端一致、热端清空——`cmd_archive` 把
+    `--yes` 正确映射到 `archive()` 的 `execute` 参数。"""
+    cfg = _settings_yaml_with_cold(tmp_path)
+    s = Settings(raw_dir=tmp_path / "raw", manifest_dir=tmp_path / "manifests",
+                store_dir=tmp_path / "store", cold_dir=tmp_path / "cold")
+    raw = _archivable_month(s)
+    body = raw.read_bytes()
+
+    rc = cli.main(["--config", str(cfg), "archive", "--yes"])
+
+    assert rc == 0
+    assert not raw.exists()
+    cold = cold_path(s.cold_dir, "202601", "2m_temperature.nc")
+    assert cold.read_bytes() == body

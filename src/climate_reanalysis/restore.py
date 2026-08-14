@@ -15,6 +15,7 @@ from pathlib import Path
 import numpy as np
 import xarray as xr
 
+from climate_reanalysis.archive import cold_path
 from climate_reanalysis.logging_setup import get_logger
 from climate_reanalysis.manifest import (
     iter_manifests,
@@ -39,7 +40,27 @@ def _open_one(path: Path) -> xr.Dataset:
     return ds.rename({tname: "time"})
 
 
-def load_raw(files: list[Path], var: str, month: str) -> tuple[np.ndarray, list[str]]:
+def _resolve(path: Path, month: str, cold_dir: Path | None) -> Path:
+    """热端文件不存在时回退到冷端——归档（``archive.py``）只搬文件本身、
+    绝不改 manifest 内容，``path`` 记的仍是热端原路径，这里按 basename 去
+    ``cold_path(cold_dir, month, ...)`` 找。两处都没有才报错；``cold_dir``
+    为 ``None``（未配置归档）时行为与之前完全一致——只看热端。
+    """
+    if path.exists():
+        return path
+    if cold_dir is not None:
+        cold = cold_path(Path(cold_dir), month, path.name)
+        if cold.exists():
+            return cold
+        raise FileNotFoundError(
+            f"原始文件缺失：热端 {path} 与冷端 {cold} 都没有"
+        )
+    raise FileNotFoundError(f"原始文件缺失：{path}（未配置 cold_dir，不做冷端回退）")
+
+
+def load_raw(
+    files: list[Path], var: str, month: str, cold_dir: Path | None = None
+) -> tuple[np.ndarray, list[str]]:
     """读该产出变量的全部 CDS 文件，换算并对齐到契约网格与时间轴。
 
     网格与时间轴的校验**逐文件**做，不是只查循环里最后处理的那一个——
@@ -55,6 +76,10 @@ def load_raw(files: list[Path], var: str, month: str) -> tuple[np.ndarray, list[
     并集（ERA5 final=0001 / ERA5T 初步=0005 标记）——多文件变量（si10）
     的两个源文件各自记各自的，不要求互相一致，只取并集；文件里没有这个
     坐标（老数据/非该来源）时贡献空集，不报错。
+
+    ``cold_dir`` 不为 ``None`` 时，逐文件在打开前先经 ``_resolve``：热端存在
+    就用热端，热端缺失（已被 ``archive`` 搬走）则回退到冷端同名文件，两处
+    都没有才报错——这是"月库丢了不必重下"自愈路径的落点。
     """
     arrays: dict[str, np.ndarray] = {}
     expvers: set[str] = set()
@@ -66,7 +91,7 @@ def load_raw(files: list[Path], var: str, month: str) -> tuple[np.ndarray, list[
         hit = [q for q in paths if q.stem == cds_var]
         if len(hit) != 1:
             raise ValueError(f"{var}: 找不到唯一的 {cds_var} 文件（{[q.name for q in paths]}）")
-        ds = _open_one(hit[0])
+        ds = _open_one(_resolve(hit[0], month, cold_dir))
         if "expver" in ds.coords:
             # 读值必须在 ds.close() 之前，理由同下面 da.values 那行的注释
             expvers.update(str(v) for v in np.asarray(ds["expver"].values).tolist())
@@ -114,7 +139,7 @@ def restore_one(settings, manifest_file: Path) -> str:
         return "skip"
     # 形状/时间轴的校验已经下沉到 load_raw（逐文件核对，比这里事后再查一次
     # data.shape[0] 更严格——它连"数量对但内容错位"都会挡住），这里不必重复。
-    data, expver = load_raw([f["path"] for f in d["files"]], var, month)
+    data, expver = load_raw([f["path"] for f in d["files"]], var, month, settings.cold_dir)
     write_variable(settings.store_dir, month, var, data,
                    {"manifest_sha256": sha, "completed_at": d["completed_at"],
                     "source": d["source"]["dataset"], "expver": expver})

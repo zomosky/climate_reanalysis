@@ -12,6 +12,11 @@ manifest_dir: data/manifests
 # /training_data/climate_data/era5/monthly。
 store_dir: data/monthly
 
+# 冷盘归档根目录；留空（出厂 None）= 未配置，`archive` 命令拒绝执行——本机
+# 测试环境通常没有这块盘。服务器示例（与本仓库其它管线的冷盘约定一致）：
+# /save_data/climate_data/era5/raw，见 README「冷存归档」一节。
+cold_dir:
+
 # bulk download 走的代理；留空 = 裸连，submit/poll 一律直连（跟这里无关）。
 # 本机若有本地代理（如 Clash，默认端口 7890）可填 http://127.0.0.1:7890，
 # 实测约 4.8 MB/s；服务器目前无代理，留空裸连（实测约 10.6 KB/s，很慢，

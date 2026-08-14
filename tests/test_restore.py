@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 import xarray as xr
 
+from climate_reanalysis.archive import cold_path
 from climate_reanalysis.manifest import manifest_path, write_manifest
 from climate_reanalysis.period import month_hours
 from climate_reanalysis.restore import restore_one, scan_once
@@ -204,3 +205,48 @@ def test_si10_grid_mismatch_between_two_files_is_rejected(tmp_path: Path):
     with pytest.raises(ValueError, match="网格"):
         restore_one(s, mf)
     assert not store_path(s.store_dir, "202601").exists()
+
+
+def test_rebuild_falls_back_to_cold_copy(tmp_path: Path):
+    """月库丢了要重建，而热端 raw 已归档——能从冷端读回来，不必重下。"""
+    # 构造：manifest 在、月库无溯源（模拟月库丢失）、热端 raw 不存在、冷端有副本
+    month, cds = "202601", "surface_solar_radiation_downwards"
+    s = Settings(raw_dir=tmp_path / "raw", manifest_dir=tmp_path / "m",
+                store_dir=tmp_path / "s", cold_dir=tmp_path / "cold")
+    f = make_raw_nc(s.raw_dir / month / f"{cds}.nc", month, cds, 3600.0)
+    mf = write_manifest(s.manifest_dir, month, "ssrd", [f], AREA)
+
+    # 模拟「已归档」：内容原样搬到冷端对应位置（<cold_dir>/<month>/<basename>），
+    # 删掉热端原文件——不经过 archive() 本身，只构造 load_raw 要看到的落盘状态。
+    cold = cold_path(s.cold_dir, month, f.name)
+    cold.parent.mkdir(parents=True)
+    cold.write_bytes(f.read_bytes())
+    f.unlink()
+
+    # 断言：restore 成功、月库数值正确（不必重下——从冷端读回来自愈）
+    assert restore_one(s, mf) == "done"
+    ds = xr.open_zarr(store_path(s.store_dir, month), consolidated=True)
+    np.testing.assert_allclose(ds["ssrd"].values[0, 0, 0], 1.0)   # 3600/3600
+
+
+def test_missing_raw_without_cold_dir_raises(tmp_path: Path):
+    """cold_dir 未配置（出厂 None）时行为不变——热端缺失直接报错，不会误报
+    "成功"，也不会因为新逻辑而意外吞掉这种缺失。"""
+    s, mf = _prepare(tmp_path)
+    (s.raw_dir / "202601" / "surface_solar_radiation_downwards.nc").unlink()
+    with pytest.raises(FileNotFoundError):
+        restore_one(s, mf)
+
+
+def test_missing_raw_and_missing_cold_copy_raises(tmp_path: Path):
+    """两处都没有才报错：配置了 cold_dir，但冷端也没有这份文件——不能假装
+    找到了，必须点名报错。"""
+    month, cds = "202601", "surface_solar_radiation_downwards"
+    s = Settings(raw_dir=tmp_path / "raw", manifest_dir=tmp_path / "m",
+                store_dir=tmp_path / "s", cold_dir=tmp_path / "cold")
+    f = make_raw_nc(s.raw_dir / month / f"{cds}.nc", month, cds, 3600.0)
+    mf = write_manifest(s.manifest_dir, month, "ssrd", [f], AREA)
+    f.unlink()   # 热端缺失，冷端目录甚至没建过
+
+    with pytest.raises(FileNotFoundError):
+        restore_one(s, mf)

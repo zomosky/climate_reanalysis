@@ -21,6 +21,10 @@ class Settings(BaseModel):
     manifest_dir: Path = Path("data/manifests")
     #: 月度国网库（zrread 的 era5 源指向它）
     store_dir: Path = Path("data/monthly")
+    #: 冷盘归档根目录；None = 未配置——archive 命令拒绝执行（本机/测试环境
+    #: 通常没有这块盘，绝不能给一个看似无害的默认值让归档悄悄发生）。
+    #: 配置后布局为 cold_dir/<YYYYMM>/<原始文件名>，与 raw_dir 同构
+    cold_dir: Path | None = None
     #: bulk download 走的代理；None = 裸连。submit/poll 一律直连（trust_env=False）
     dl_proxy: str | None = None
     #: 每期并发下载的变量数。链路退化（日志频现 curl rc=18）时调低到 1-2
@@ -64,6 +68,7 @@ def load_settings(path: Path | None = None) -> Settings:
             "raw_dir": _anchor(base, s.raw_dir),
             "manifest_dir": _anchor(base, s.manifest_dir),
             "store_dir": _anchor(base, s.store_dir),
+            "cold_dir": _anchor(base, s.cold_dir) if s.cold_dir else None,
             "cdsapirc": s.cdsapirc.expanduser() if s.cdsapirc else None,
         }
     )

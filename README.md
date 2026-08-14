@@ -47,6 +47,7 @@ cp config/settings.yaml.example config/settings.yaml
 | `concurrency` | 每期并发下载的（月×变量）任务数，出厂 4 |
 | `publish_lag_days` | ERA5 发布延迟（天），出厂 5——月末再等这么多天才认为该月齐全 |
 | `refresh_after_days` | ERA5T 初步数据换新窗口（天），出厂 100——月末再等这么多天才认为初步值「过期」，见下方「ERA5T 刷新」 |
+| `cold_dir` | 冷盘归档根目录；留空（出厂 `None`）= 未配置，`archive` 拒绝执行，见下方「冷存归档」 |
 | `area` | 请求区域 `(N, W, S, E)`，需与产出网格 15–55N / 70–140E 一致 |
 | `cdsapirc` | 指定 `.cdsapirc` 路径；留空 = `~/.cdsapirc`（多账号轮换时可另起一份） |
 
@@ -151,6 +152,87 @@ uv run climate_reanalysis refresh --yes                          # 确认清单�
 一节里的手工恢复步骤是同一套底层机制（删 manifest → 触发 sha 不符 → 自然重建），
 `refresh` 只是把它包装成一个显式、可预览、按 ERA5T 判据自动找出目标的命令。
 
+## 冷存归档
+
+原始 netCDF（`raw_dir`）很占地方：单变量单月约 55 MB，九个变量、二十年历史就是
+几 TB。`raw_dir` 的说明写着「restore 成功后可删」，但**直接删掉会让月库一旦丢失/
+损坏就无法自愈**——见上一节「raw 清理后月库损坏」，那条路径除了人工重新走一遍
+`download`（真实 CDS 请求、排队+带宽）别无他法。`archive` 要解决的正是这个：把
+已经确认「下游用不到热盘也能自愈」的原始文件搬到冷盘，热盘腾出空间，冷盘留一份
+兜底副本。
+
+### 与服务器上 `forecast-coldmove.sh` 的关系
+
+部署服务器（`climate_pipeline` 其它管线共用）上热盘是 `/training_data`、冷盘是
+`/save_data`（44 TB），已有一个宿主机 shell 脚本 `forecast-coldmove.sh` 做同样
+性质的事：判据是「下游产品已固化（`.zmetadata` 存在）才允许搬」，但校验只做到
+「比对文件个数」。
+
+`archive` 沿用同一条判据语义（下游已固化才搬），但**做成本项目自己的命令而不是
+shell 脚本**——因为 manifest 里本来就记着每个原始文件的 sha256，可以逐文件比对
+内容，而不是像那份脚本一样只数数量（数量对但某个文件已经悄悄损坏，coldmove 式
+校验发现不了）。两者不共享实现，只是判据取向一致。
+
+### 判据与搬运顺序
+
+「下游已固化」在本项目里就是 `archivable()` 的判据：该 (月, 变量) 在月库里的
+溯源 `manifest_sha256`，与该 manifest **当前**的 sha 相等——即 `restore` 确已
+成功处理过这份 manifest，且 manifest 自身没有被后续改动（比如被 `refresh` 删掉
+重下过）。不相等（月库溯源落后、或还没 restore 过）或压根没有溯源，一律不搬。
+
+**先搬后删、验完再删**，顺序即安全性：
+
+1. 拷贝到冷端的临时名（同目录，带 pid，同 `manifest.py` 写 manifest 的做法，
+   避免并发归档进程互相踩踏）。
+2. 算冷端副本的 sha256，与 **manifest 里记录的那个 sha256** 比对；不符 →
+   删临时文件、跳过整份 manifest、告警，**绝不删热端**。一份 manifest 可能
+   对应多个原始文件（如 `si10` = u10 + v10 两个源文件），任何一个文件校验不
+   通过，这份 manifest 的全部文件都不动，不做部分搬运。
+3. 全部文件校验通过后，才 `os.replace` 临时名 → 冷端正式名（同目录内原子
+   操作）。
+4. 确认冷端正式名就位（存在 + 内容 sha 仍正确）之后，才删热端。
+
+任何一步失败都不许删热端——热端在归档这一刻是唯一已确认完整的副本，这个顺序
+反了就是不可逆的数据丢失。
+
+**绝不修改 manifest 文件的内容**：manifest 的 sha256 是 `restore` 幂等判断的
+比对键，改它等于宣布对应月份需要重建。所以冷端位置**不写进 manifest**——
+`restore.load_raw` 找不到热端文件时，直接按 `cold_dir/<月份>/<原始文件名>`
+去冷端找（`archive.cold_path` 与 `restore._resolve` 共用同一条拼路径逻辑）；
+两处都没有才报错。`cold_dir` 为 `None`（未配置）时，这条回退不生效，行为与
+引入本功能之前完全一致。
+
+### 命令用法
+
+形态照 `refresh`/`cleanup-jobs` 的范式：默认 dry-run，只有显式 `--yes` 才真正
+搬运并清理热端。
+
+```bash
+uv run climate_reanalysis archive          # 默认 dry-run：只统计将搬走的文件数/跳过的 manifest 数，不动任何文件
+uv run climate_reanalysis archive --yes    # 确认统计无误后，加 --yes 才真正搬运并清理热端
+```
+
+`cold_dir` 未在配置里显式指定（出厂 `None`）时，`archive` 拒绝执行并报错——
+不给任何看似无害的默认路径（本机/多数开发环境根本没有那块盘），必须在
+`config/settings.yaml` 里显式写清楚冷盘位置才能归档。服务器上按本仓库其它
+管线的冷盘约定，示例配成 `/save_data/climate_data/era5/raw`。
+
+### 月库丢失时的恢复路径
+
+如果某个月库在归档**之后**又损坏/丢失（磁盘问题、误删 `.zarr` 目录等），此时
+`raw_dir` 里对应的原始文件已经不在热盘上了——但不必因此重新发起真实 CDS 请求：
+
+1. 确认受影响的 (月×变量)（同「raw 清理后月库损坏」一节，从 `restore` 的
+   `restore_failed` 报错日志读）。
+2. **不需要**删 manifest、也**不需要**跑 `download`——`restore`（或 `scan-once`）
+   直接重跑即可：`load_raw` 发现热端文件缺失，自动回退到
+   `cold_dir/<月份>/<原始文件名>` 读取原始数据，照常换算、写回月库。
+3. 只有当冷端那份副本本身也不在/损坏（理论上不该发生：归档已经做过逐文件 sha
+   校验才落盘）时，才需要退回「raw 清理后月库损坏」一节的人工重下流程。
+
+这条自愈路径正是本功能存在的意义——冷存归档换来的不只是热盘空间，更是「月库
+出问题时不必重新排队几十小时 CDS 请求」这件事本身。
+
 ## 历史迁移（一次性）
 
 现有历史月库（`solarcast` 一次性烘焙的 240 个月，`ssrd`/`fdir`/`t2m`/`si10`/`sp` 等
@@ -230,6 +312,12 @@ cron 按"每天一次"这种周期挂，上一轮还没跑完下一轮就起来�
 
 ## raw 清理后月库损坏：唯一不能自愈的路径，须手工恢复
 
+**这一节针对的是 raw 被手工删除（`rm`）的情况**——如果 raw 是被 `archive` 命令
+搬走的（而不是直接删除），恢复路径完全不同、也不需要人工介入，见上面「冷存
+归档」一节的「月库丢失时的恢复路径」：`restore` 会自动从冷端读回来，不必重下。
+本节说的"须手工恢复"，指的是原始文件已经彻底不存在（既不在热盘、也没有冷端
+副本）的情况。
+
 `raw_dir` 的说明写着"restore 成功后可删"——这在正常情况下没问题：`restore` 只在
 manifest 的 sha 与月库溯源不一致时才需要读 raw，一致就跳过，不会碰 raw。但 manifest
 **在**这件事，同时也是 `download` 判断"这个 (月×变量) 已经处理过、不用再下"的**唯一**
@@ -279,6 +367,7 @@ src/climate_reanalysis/
   restore.py     单元 B：scan-once 幂等切库
   migrate.py     单元 C：历史迁移，打 legacy 溯源
   refresh.py     ERA5T 刷新：删过期月份的 manifest，交给 download+restore 自然重下 final
+  archive.py     冷存归档：下游已固化才搬、逐文件 sha 校验、先搬后删；restore 冷端回退共用 cold_path
   cli.py         参数 → 调用的翻译层，不含业务逻辑
 tests/           零真实网络依赖，全量 ~10s
 ```

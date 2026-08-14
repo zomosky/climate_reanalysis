@@ -16,6 +16,7 @@ def test_defaults_match_spec():
     assert s.area == (55.0, 70.0, 15.0, 140.0)   # N W S E，与产出网格同框
     assert s.concurrency == 4
     assert s.dl_proxy is None               # 不得硬编码代理
+    assert s.cold_dir is None               # 未配置 = 归档拒绝执行，不给默认路径
 
 
 def test_relative_paths_anchor_to_project_root(tmp_path: Path):
@@ -36,6 +37,22 @@ def test_absolute_paths_kept(tmp_path: Path):
     cfg.parent.mkdir(parents=True)
     cfg.write_text(f"store_dir: {tmp_path / 'abs'}\n", encoding="utf-8")
     assert load_settings(cfg).store_dir == tmp_path / "abs"
+
+
+def test_cold_dir_anchors_like_other_data_paths_when_configured(tmp_path: Path):
+    cfg = tmp_path / "config" / "settings.yaml"
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text("cold_dir: data/cold\n", encoding="utf-8")
+    assert load_settings(cfg).cold_dir == tmp_path / "data" / "cold"
+
+
+def test_cold_dir_stays_none_when_not_configured(tmp_path: Path):
+    """出厂 None 必须原样透传，不能被锚定逻辑意外变成某个具体路径——
+    ``archive`` 命令靠"是不是 None"判断归档是否被显式配置过。"""
+    cfg = tmp_path / "config" / "settings.yaml"
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text("raw_dir: data/raw\n", encoding="utf-8")
+    assert load_settings(cfg).cold_dir is None
 
 
 def test_missing_file_falls_back_to_defaults():

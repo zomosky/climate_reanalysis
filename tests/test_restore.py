@@ -172,6 +172,23 @@ def test_time_axis_mismatch_is_rejected_not_silently_written(tmp_path: Path):
     assert not store_path(s.store_dir, month).exists()
 
 
+def test_provenance_records_expver_sorted_unique(tmp_path: Path):
+    """expver 逐时刻取值；跨 ERA5/ERA5T 边界的月份会混合两种，必须都记下来。"""
+    s = _settings(tmp_path)
+    f = make_raw_nc(s.raw_dir / "202601" / "2m_temperature.nc", "202601",
+                    "2m_temperature", expver=["0005"] * 372 + ["0001"] * 372)
+    mf = write_manifest(s.manifest_dir, "202601", "t2m", [f], AREA)
+    assert restore_one(s, mf) == "done"
+    assert read_provenance(s.store_dir, "202601")["t2m"]["expver"] == ["0001", "0005"]
+
+
+def test_provenance_expver_empty_when_coordinate_absent(tmp_path: Path):
+    """没有 expver 坐标的文件不该让整条管线报错——记空列表即可。"""
+    s, mf = _prepare(tmp_path, month="202601", var="t2m", cds="2m_temperature", value=280.0)
+    assert restore_one(s, mf) == "done"
+    assert read_provenance(s.store_dir, "202601")["t2m"]["expver"] == []
+
+
 def test_si10_grid_mismatch_between_two_files_is_rejected(tmp_path: Path):
     """si10 由 u10/v10 两个文件合成，两个文件的网格都必须核对契约——不能只
     核对循环里最后处理的那一个（否则另一个网格错位时 np.hypot 会静默按位置

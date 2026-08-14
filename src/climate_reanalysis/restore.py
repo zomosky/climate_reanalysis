@@ -39,7 +39,7 @@ def _open_one(path: Path) -> xr.Dataset:
     return ds.rename({tname: "time"})
 
 
-def load_raw(files: list[Path], var: str, month: str) -> np.ndarray:
+def load_raw(files: list[Path], var: str, month: str) -> tuple[np.ndarray, list[str]]:
     """读该产出变量的全部 CDS 文件，换算并对齐到契约网格与时间轴。
 
     网格与时间轴的校验**逐文件**做，不是只查循环里最后处理的那一个——
@@ -50,8 +50,14 @@ def load_raw(files: list[Path], var: str, month: str) -> np.ndarray:
     多一格但总数凑巧不变）如果只查数量会被放过，写进库里就是一次没有任何
     征兆的静默时间平移——这是下游直接读的库，这个位置的静默错误代价最高，
     比抛错严重得多，所以宁可算得贵一点也要挡在这里。
+
+    第二个返回值是该产出变量涉及的全部原始文件**排序去重后**的 `expver`
+    并集（ERA5 final=0001 / ERA5T 初步=0005 标记）——多文件变量（si10）
+    的两个源文件各自记各自的，不要求互相一致，只取并集；文件里没有这个
+    坐标（老数据/非该来源）时贡献空集，不报错。
     """
     arrays: dict[str, np.ndarray] = {}
+    expvers: set[str] = set()
     expected_time = month_hours(month)
     paths = [Path(f) for f in files]
     for cds_var in VAR_SPECS[var].cds:
@@ -61,6 +67,9 @@ def load_raw(files: list[Path], var: str, month: str) -> np.ndarray:
         if len(hit) != 1:
             raise ValueError(f"{var}: 找不到唯一的 {cds_var} 文件（{[q.name for q in paths]}）")
         ds = _open_one(hit[0])
+        if "expver" in ds.coords:
+            # 读值必须在 ds.close() 之前，理由同下面 da.values 那行的注释
+            expvers.update(str(v) for v in np.asarray(ds["expver"].values).tolist())
         if cds_var in ds.data_vars:
             name = cds_var
         else:
@@ -91,7 +100,7 @@ def load_raw(files: list[Path], var: str, month: str) -> np.ndarray:
                 f"（{time.size} 步 vs 期望 {expected_time.size} 步，或时刻错位）"
             )
         arrays[cds_var] = values
-    return convert(var, arrays).astype("float32")
+    return convert(var, arrays).astype("float32"), sorted(expvers)
 
 
 def restore_one(settings, manifest_file: Path) -> str:
@@ -105,10 +114,10 @@ def restore_one(settings, manifest_file: Path) -> str:
         return "skip"
     # 形状/时间轴的校验已经下沉到 load_raw（逐文件核对，比这里事后再查一次
     # data.shape[0] 更严格——它连"数量对但内容错位"都会挡住），这里不必重复。
-    data = load_raw([f["path"] for f in d["files"]], var, month)
+    data, expver = load_raw([f["path"] for f in d["files"]], var, month)
     write_variable(settings.store_dir, month, var, data,
                    {"manifest_sha256": sha, "completed_at": d["completed_at"],
-                    "source": d["source"]["dataset"]})
+                    "source": d["source"]["dataset"], "expver": expver})
     log.info("restored", month=month, var=var)
     return "done"
 

@@ -57,7 +57,17 @@ class IncompleteStoreHasDataError(RuntimeError):
 
 
 def store_path(store_dir: Path, month: str) -> Path:
-    return Path(store_dir) / f"{month}_era5.zarr"
+    """月库落盘位置——按年分层：``<store_dir>/<YYYY>/<YYYYMM>_era5.zarr``。
+
+    年份直接取月份 token 的前四位，不另外解析——``month`` 全项目统一是
+    ``YYYYMM`` 六位字符串，这个前提在 ``variables.py``/``period.py`` 等处也
+    是硬编码假设。持续积累管线每年新增 12 个库，按年分层是运维（rsync/校验/
+    归档按年切）的最小代价改动；此前的扁平 240 个库由独立的一次性迁移脚本
+    （``scripts/migrate_to_year_layout.py``）挪，不在这里做兼容判断——本项目
+    是这份档案的唯一生产者，不需要像 zrread 读取端那样兼容旧布局。
+    """
+    year = month[:4]
+    return Path(store_dir) / year / f"{month}_era5.zarr"
 
 
 def check_area_matches_grid(area: tuple[float, float, float, float]) -> None:

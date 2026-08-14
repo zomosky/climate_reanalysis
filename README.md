@@ -16,7 +16,7 @@ ERA5 再分析的**持续积累**管线，与 `climate_pipeline` 里的 `downloa
 | 命令 | 作用 |
 |---|---|
 | `download` | 每（月 × 产出变量）一次 CDS 请求 → `raw/` + `manifests/`（唯一的就绪信号） |
-| `restore` | 幂等一趟扫描 manifest → 写进 `<YYYYMM>_era5.zarr`（可 cron） |
+| `restore` | 幂等一趟扫描 manifest → 写进 `<YYYY>/<YYYYMM>_era5.zarr`（按年分层，可 cron） |
 | `migrate` | 给既有月库的历史变量打 legacy 溯源，使 restore 认为已就位，避免重下 |
 | `bake-legacy` | 一次性历史导入：把 `solarcast` 省级 20 年 tile 直接烘成月度国网库（见下方「历史导入（一次性烘焙）」） |
 
@@ -43,7 +43,7 @@ cp config/settings.yaml.example config/settings.yaml
 |---|---|
 | `raw_dir` | 原始 netCDF 落盘（restore 成功后可删） |
 | `manifest_dir` | manifest 目录——**唯一**的就绪信号 |
-| `store_dir` | 月度国网库（`climate_zrread` 的 `era5` 源指向它） |
+| `store_dir` | 月度国网库根目录，按年分层落盘（`climate_zrread` 的 `era5` 源指向它，见下方「月库目录结构」） |
 | `dl_proxy` | **只用于 bulk download**，submit/poll 一律直连；留空 = 裸连 |
 | `concurrency` | 每期并发下载的（月×变量）任务数，出厂 4 |
 | `publish_lag_days` | ERA5 发布延迟（天），出厂 5——月末再等这么多天才认为该月齐全 |
@@ -65,6 +65,34 @@ cp config/settings.yaml.example config/settings.yaml
 url: https://cds.climate.copernicus.eu/api
 key: <your-key>
 ```
+
+## 月库目录结构（按年分层）
+
+`store_dir` 下的月库按年分层：
+
+```
+<store_dir>/<YYYY>/<YYYYMM>_era5.zarr
+```
+
+例如 202601 落在 `<store_dir>/2026/202601_era5.zarr`，不再是早前的扁平
+`<store_dir>/202601_era5.zarr`。这是持续积累管线的特性倒逼的改动——20 年历史
+就是 240 个月库，此后每年还要新增 12 个，扁平堆在一个目录下之后按年 rsync/
+校验/归档都不方便；`store_path()` 是唯一拼这个路径的地方（`ensure_store` 建库
+时年份子目录随 `mkdir(parents=True)` 一起建出来，调用方不需要关心），
+`bake-legacy`/`refresh` 等所有落盘/扫描路径都改成调它，不在别处各自拼一份。
+
+**这是本项目的一次性结构调整，不是兼容层**——`climate_reanalysis` 是这份档案
+唯一的生产者，不需要像下游 `climate_zrread` 的观测源读取端那样同时认得新旧两
+种布局。已有的历史月库（扁平）需要手工迁移一次：
+
+```bash
+uv run python scripts/migrate_to_year_layout.py --store-dir /path/to/store_dir          # 默认 dry-run：只打印将搬运的清单，不动任何文件
+uv run python scripts/migrate_to_year_layout.py --store-dir /path/to/store_dir --yes     # 确认清单无误后，加 --yes 才真正搬运
+```
+
+同一块盘内用 `os.rename` 挪目录，秒级完成，不是逐文件拷贝。幂等——已经在年份
+子目录下的库不会被当作候选，重跑是空操作；目标位置意外已存在时报错点名并
+跳过（不覆盖），不阻塞其余月库继续搬。
 
 ## download / restore 怎么调
 
@@ -442,7 +470,7 @@ manifest 的 sha 与月库溯源不一致时才需要读 raw，一致就跳过�
 `restore` 报错退出非 0，**但绝不会自动删除或重建这个库**（这是刻意的：库里可能还有
 其它变量的真实数据幸存，自动重建会把它们一并静默清空）。这种情况仅删 manifest 重跑
 `download`/`restore` 不够——损坏的是月库文件本身，需要人工确认后手动删除/搬走这个
-`<YYYYMM>_era5.zarr` 目录，再按上面的步骤重新走一遍。另有一种中间状态：库能打开但
+`<YYYY>/<YYYYMM>_era5.zarr` 目录，再按上面的步骤重新走一遍。另有一种中间状态：库能打开但
 骨架不完整（建到一半崩溃）——若确认是空壳（无真实数据无溯源）会自动安全重建并打
 `rebuilding_empty_skeleton` 日志；若已经写入过真实数据/溯源则同样拒绝重建，抛
 `IncompleteStoreHasDataError`，需要人工核实后再决定重建还是修复。
@@ -468,6 +496,7 @@ src/climate_reanalysis/
     deconv.py      中点化（:30）反解回 ERA5 原生整点轴
     bake.py        遍历分片 × 变量，把 tile 数据换算、写入月库
   cli.py         参数 → 调用的翻译层，不含业务逻辑
+scripts/         一次性运维脚本（不是常驻管线），如 migrate_to_year_layout.py
 tests/           零真实网络依赖，全量 ~10s
 ```
 

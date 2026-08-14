@@ -8,6 +8,7 @@ import xarray as xr
 
 from climate_reanalysis.legacy_bake.bake import CHUNK, SHARD, bake, create_month_store, open_tile
 from climate_reanalysis.legacy_bake.grid import TARGET_LAT, TARGET_LON, Ledger
+from climate_reanalysis.store import store_path
 
 HOURS = 48  # 两天，够覆盖跨日且跑得快
 START = np.datetime64("2026-01-01T00:00", "ns")  # 原生整点轴的起点
@@ -90,7 +91,7 @@ def test_coverage_coord_marks_only_tiled_cells(tmp_path):
     out = tmp_path / "monthly"
     bake([tile], out, ["202601"], _ledger(tmp_path), hours=HOURS)
 
-    ds = xr.open_zarr(out / "202601_era5.zarr", consolidated=True)
+    ds = xr.open_zarr(store_path(out, "202601"), consolidated=True)
     assert "coverage" in ds.coords  # 坐标而非数据变量
     assert "coverage" not in ds.data_vars
     assert int(ds["coverage"].sel(latitude=30.0, longitude=110.0)) == 1
@@ -104,7 +105,7 @@ def test_bake_lands_values_on_correct_cells_with_native_hour_axis(tmp_path):
 
     out = tmp_path / "monthly"
     bake([tile], out, ["202601"], _ledger(tmp_path), hours=HOURS)
-    ds = xr.open_zarr(out / "202601_era5.zarr", consolidated=True)
+    ds = xr.open_zarr(store_path(out, "202601"), consolidated=True)
 
     assert ds["time"].values[0] == START  # 时间轴还原到整点
     # 通量仅重贴标签：值与源库逐位相同
@@ -134,7 +135,7 @@ def test_bake_clips_cells_below_15n(tmp_path):
     _make_tile(tile, 13.0, 16.0, 110.0, 110.5)
     out = tmp_path / "monthly"
     bake([tile], out, ["202601"], _ledger(tmp_path), hours=HOURS)
-    ds = xr.open_zarr(out / "202601_era5.zarr", consolidated=True)
+    ds = xr.open_zarr(store_path(out, "202601"), consolidated=True)
     assert not np.isnan(ds["t2m"].sel(latitude=15.0, longitude=110.0).values).any()
     assert float(ds["latitude"].min()) == 15.0  # 13-14.75 根本不在网格上
 
@@ -168,9 +169,9 @@ def test_bake_is_idempotent_via_ledger(tmp_path):
     led = _ledger(tmp_path)
 
     bake([tile], out, ["202601"], led, hours=HOURS)
-    first = xr.open_zarr(out / "202601_era5.zarr", consolidated=True)["t2m"].values.copy()
+    first = xr.open_zarr(store_path(out, "202601"), consolidated=True)["t2m"].values.copy()
     bake([tile], out, ["202601"], led, hours=HOURS)  # 重跑
-    second = xr.open_zarr(out / "202601_era5.zarr", consolidated=True)["t2m"].values
+    second = xr.open_zarr(store_path(out, "202601"), consolidated=True)["t2m"].values
     np.testing.assert_array_equal(first, second)
 
 
@@ -181,7 +182,7 @@ def test_bake_single_variable_leaves_others_untouched(tmp_path):
     _make_tile(tile, 30.0, 31.0, 110.0, 111.0)
     out = tmp_path / "monthly"
     bake([tile], out, ["202601"], _ledger(tmp_path), variables=["t2m"], hours=HOURS)
-    ds = xr.open_zarr(out / "202601_era5.zarr", consolidated=True)
+    ds = xr.open_zarr(store_path(out, "202601"), consolidated=True)
     assert not np.isnan(ds["t2m"].sel(latitude=30.0, longitude=110.0).values).any()
     assert np.isnan(ds["ssrd"].sel(latitude=30.0, longitude=110.0).values).all()
 
@@ -220,7 +221,7 @@ def test_deconv_seeded_from_series_origin_not_slice_start(tmp_path):
 
     out = tmp_path / "monthly"
     bake([path], out, ["202602"], _ledger(tmp_path), variables=["t2m"], hours=48)
-    ds = xr.open_zarr(out / "202602_era5.zarr", consolidated=True)
+    ds = xr.open_zarr(store_path(out, "202602"), consolidated=True)
     got = ds["t2m"].sel(latitude=30.0, longitude=110.0).values
     expect = x[31 * 24 : 31 * 24 + 48, 0, 0] + 273.15
     np.testing.assert_allclose(got, expect, atol=0.02)
@@ -234,8 +235,8 @@ def test_bake_handles_non_contiguous_months(tmp_path):
     out = tmp_path / "monthly"
     # tile 只覆盖 202601 前 48h；202603 无源数据，应保持全 NaN 而不是崩
     bake([tile], out, ["202601", "202603"], _ledger(tmp_path), hours=HOURS)
-    a = xr.open_zarr(out / "202601_era5.zarr", consolidated=True)
-    b = xr.open_zarr(out / "202603_era5.zarr", consolidated=True)
+    a = xr.open_zarr(store_path(out, "202601"), consolidated=True)
+    b = xr.open_zarr(store_path(out, "202603"), consolidated=True)
     assert not np.isnan(a["t2m"].sel(latitude=30.0, longitude=110.0).values).any()
     assert np.isnan(b["t2m"].sel(latitude=30.0, longitude=110.0).values).all()
 
@@ -252,7 +253,7 @@ def test_new_tile_invalidates_ledger(tmp_path):
 
     t1 = [d / "A.zarr"]
     bake(t1, out, ["202601"], Ledger.load(lp, tiles_fingerprint(t1)), hours=HOURS)
-    ds = xr.open_zarr(out / "202601_era5.zarr", consolidated=True)
+    ds = xr.open_zarr(store_path(out, "202601"), consolidated=True)
     assert np.isnan(ds["t2m"].sel(latitude=40.0, longitude=120.0).values).all()
 
     # 新增一个别处的 tile —— 若账本未作废，这片区域会保持 NaN
@@ -261,7 +262,7 @@ def test_new_tile_invalidates_ledger(tmp_path):
     led2 = Ledger.load(lp, tiles_fingerprint(t2))
     assert not led2.done("202601", "t2m", 0), "tile 集合变了，账本应作废"
     bake(t2, out, ["202601"], led2, hours=HOURS)
-    ds = xr.open_zarr(out / "202601_era5.zarr", consolidated=True)
+    ds = xr.open_zarr(store_path(out, "202601"), consolidated=True)
     assert not np.isnan(ds["t2m"].sel(latitude=40.0, longitude=120.0).values).any()
     assert int(ds["coverage"].sel(latitude=40.0, longitude=120.0)) == 1
 
@@ -283,7 +284,7 @@ def test_appended_tile_vars_flow_into_existing_month_store(tmp_path):
 
     bake([tile], out, ["202601"], Ledger.load(lp, tiles_fingerprint([tile])),
          hours=HOURS)
-    ds = xr.open_zarr(out / "202601_era5.zarr", consolidated=True)
+    ds = xr.open_zarr(store_path(out, "202601"), consolidated=True)
     assert np.isnan(ds["ssrdc"].values).all(), "源里还没有 ssrdc，应全 NaN"
 
     # 模拟补下：往省库追加 ssrdc（区间平均通量，不参与中点搬移）
@@ -298,7 +299,7 @@ def test_appended_tile_vars_flow_into_existing_month_store(tmp_path):
     assert not led.done("202601", "ssrdc", 0), "tile 内容变了，账本应作废"
     bake([tile], out, ["202601"], led, hours=HOURS)
 
-    ds = xr.open_zarr(out / "202601_era5.zarr", consolidated=True)
+    ds = xr.open_zarr(store_path(out, "202601"), consolidated=True)
     got = ds["ssrdc"].sel(latitude=30.0, longitude=110.0).values
     assert not np.isnan(got).any()
     np.testing.assert_allclose(

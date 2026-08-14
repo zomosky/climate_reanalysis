@@ -56,13 +56,17 @@ def _month_end(month: str) -> dt.date:
 
 def _iter_months(store_dir: Path) -> list[str]:
     """列出月库目录里已存在的月份 token（按文件名反推，排序），目录不存在则
-    为空列表——`refresh` 在没建过任何月库的全新环境里应当是安全的空操作。"""
+    为空列表——`refresh` 在没建过任何月库的全新环境里应当是安全的空操作。
+
+    月库按年分层落盘（``store_path`` 的契约：``<store_dir>/<YYYY>/
+    <YYYYMM>_era5.zarr``），故往下多 glob 一层年份目录——不在 ``store_dir``
+    本身下找。"""
     d = Path(store_dir)
     if not d.is_dir():
         return []
     return sorted(
         p.name[: -len(_STORE_SUFFIX)]
-        for p in d.glob(f"*{_STORE_SUFFIX}")
+        for p in d.glob(f"*/*{_STORE_SUFFIX}")
     )
 
 

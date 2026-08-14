@@ -32,6 +32,7 @@ from climate_reanalysis.legacy_bake.grid import (
     tile_coverage,
     tiles_fingerprint,
 )
+from climate_reanalysis.store import store_path
 
 #: 省库时间戳 = ERA5 原生整点 − 30min（solarcast 为 pvlib 做的中点化）
 CENTRE_OFFSET = np.timedelta64(30, "m")
@@ -161,8 +162,8 @@ def create_month_store(
     times = month_hours(month, hours)
     n = times.size
     root = Path(root)
-    root.mkdir(parents=True, exist_ok=True)
-    path = root / f"{month}_era5.zarr"
+    path = store_path(root, month)
+    path.parent.mkdir(parents=True, exist_ok=True)
     if coverage is None:
         coverage = np.ones((TARGET_LAT.size, TARGET_LON.size), dtype=bool)
 
@@ -313,7 +314,7 @@ def bake(
 
     per_month = {m: month_hours(m, hours) for m in months}
     for month, times in per_month.items():
-        path = out_root / f"{month}_era5.zarr"
+        path = store_path(out_root, month)
         if not path.exists():
             create_month_store(out_root, month, hours, cov)
         else:
@@ -361,7 +362,7 @@ def bake(
                                 "longitude": TARGET_LON[lo]},
                     )
                     part.to_zarr(
-                        out_root / f"{month}_era5.zarr",
+                        store_path(out_root, month),
                         mode="r+",
                         region={"time": slice(0, times.size),
                                 "latitude": la, "longitude": lo},

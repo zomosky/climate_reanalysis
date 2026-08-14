@@ -47,6 +47,15 @@ def test_check_area_matches_grid_rejects_drifted_area():
         check_area_matches_grid((55.0, 70.0, 16.0, 140.0))   # S 打错了一度
 
 
+def test_store_path_nests_under_year_directory(tmp_path: Path):
+    """月库按年分层落盘（运维按年 rsync/校验/归档）：父目录名必须是月份 token
+    的前四位年份，而不是直接堆在 store_dir 下（此前的扁平布局）。"""
+    p = store_path(tmp_path, "202601")
+    assert p.parent.name == "2026"
+    assert p.parent.parent == tmp_path
+    assert p.name == "202601_era5.zarr"
+
+
 def test_ensure_store_creates_all_nine_variables_as_nan(tmp_path: Path):
     p = ensure_store(tmp_path, "202601")
     ds = xr.open_zarr(p, consolidated=True)
@@ -58,6 +67,15 @@ def test_ensure_store_creates_all_nine_variables_as_nan(tmp_path: Path):
     enc = ds["ssrd"].encoding
     assert tuple(enc["chunks"]) == (31 * 24, CHUNK, CHUNK)
     assert tuple(enc["shards"]) == (31 * 24, SHARD, SHARD)
+
+
+def test_ensure_store_creates_the_year_directory(tmp_path: Path):
+    """新建骨架时年份子目录要跟着建出来，不能只在已有目录时才生效。"""
+    year_dir = tmp_path / "2026"
+    assert not year_dir.exists()
+    ensure_store(tmp_path, "202601")
+    assert year_dir.is_dir()
+    assert (year_dir / "202601_era5.zarr").exists()
 
 
 def test_ensure_store_is_idempotent(tmp_path: Path):

@@ -15,6 +15,11 @@ store_dir: data/monthly
 # 冷盘归档根目录；留空（出厂 None）= 未配置，`archive` 命令拒绝执行——本机
 # 测试环境通常没有这块盘。服务器示例（与本仓库其它管线的冷盘约定一致）：
 # /save_data/climate_data/era5/raw，见 README「冷存归档」一节。
+#
+# 配了这个目录之后，`archive --yes` 执行前还要求目录下有哨兵文件
+# .climate_reanalysis_cold——挂载点未挂载时通常表现为一个存在的空目录，
+# 光判断目录存在挡不住"把数据搬到热盘上再删热端"这个风险。确认冷盘已经
+# 挂载后手动执行一次：touch <cold_dir>/.climate_reanalysis_cold
 cold_dir:
 
 # bulk download 走的代理；留空 = 裸连，submit/poll 一律直连（跟这里无关）。

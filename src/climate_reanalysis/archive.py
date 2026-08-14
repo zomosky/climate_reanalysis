@@ -38,7 +38,16 @@ from pathlib import Path
 
 from climate_reanalysis.logging_setup import get_logger
 from climate_reanalysis.manifest import iter_manifests, manifest_sha256, read_manifest
+from climate_reanalysis.paths import cold_path
 from climate_reanalysis.store import read_provenance
+
+__all__ = [
+    "COLD_SENTINEL_NAME",
+    "ColdDirNotMountedError",
+    "archivable",
+    "archive",
+    "cold_path",
+]
 
 log = get_logger(__name__)
 
@@ -80,14 +89,6 @@ def _require_cold_sentinel(cold_dir: Path) -> None:
             "存在挡不住误把数据搬到热盘上再删掉热端这个风险。确认冷盘确已"
             f"挂载后执行：touch {sentinel}"
         )
-
-
-def cold_path(cold_dir: Path, month: str, name: str) -> Path:
-    """冷端某个原始文件应落盘的位置——布局与 ``raw_dir/<month>/<name>`` 同构，
-    只是根换成冷盘。这个函数是归档与 restore 冷端回退共用的唯一真值，两边都
-    不该各自拼路径。
-    """
-    return Path(cold_dir) / month / name
 
 
 def _sha256_of(path: Path) -> str:

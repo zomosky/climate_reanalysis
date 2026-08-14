@@ -293,12 +293,33 @@ def test_refresh_after_days_overrides_config_default(tmp_path):
     assert not manifest_path(s.manifest_dir, "202601", "t2m").exists()
 
 
-def test_archive_requires_cold_dir_configured(tmp_path):
-    """cold_dir 出厂 None——归档命令必须拒绝执行并报错，不给一个看似无害的
-    默认路径悄悄搬走原始文件（本机/多数环境根本没有那块盘）。"""
+def test_archive_requires_cold_dir_configured(tmp_path, capsys):
+    """cold_dir 出厂 None——归档命令必须拒绝执行，不给一个看似无害的默认
+    路径悄悄搬走原始文件（本机/多数环境根本没有那块盘）。裸异常回溯不该
+    冒出 main()：必须是日志 + 非零退出码，而不是让调用方catch不到的原始
+    异常炸穿整个 CLI 进程。"""
     cfg = _settings_yaml(tmp_path)   # 没有配 cold_dir
-    with pytest.raises(ValueError):
-        cli.main(["--config", str(cfg), "archive"])
+    rc = cli.main(["--config", str(cfg), "archive"])
+    assert rc != 0
+    out = capsys.readouterr().out
+    assert "archive_failed" in out
+
+
+def test_archive_with_yes_and_unmounted_cold_dir_logs_and_returns_nonzero(
+    tmp_path, capsys
+):
+    """cold_dir 配了但没挂载（缺哨兵文件）——同样不能裸异常回溯冒出 main()，
+    必须是日志 + 非零退出码，提示运维怎么处理。"""
+    cfg = _settings_yaml_with_cold(tmp_path)
+    s = Settings(raw_dir=tmp_path / "raw", manifest_dir=tmp_path / "manifests",
+                store_dir=tmp_path / "store", cold_dir=tmp_path / "cold")
+    _archivable_month(s)   # cold_dir 从未创建、没放哨兵——模拟未挂载
+
+    rc = cli.main(["--config", str(cfg), "archive", "--yes"])
+
+    assert rc != 0
+    out = capsys.readouterr().out
+    assert "archive_failed" in out
 
 
 def test_archive_on_empty_manifest_dir_is_a_noop(tmp_path):

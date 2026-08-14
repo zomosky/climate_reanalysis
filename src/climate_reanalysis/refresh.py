@@ -31,9 +31,9 @@ from __future__ import annotations
 import datetime as dt
 from pathlib import Path
 
-from climate_reanalysis.archive import cold_path
 from climate_reanalysis.logging_setup import get_logger
 from climate_reanalysis.manifest import manifest_path, read_manifest
+from climate_reanalysis.paths import cold_path
 from climate_reanalysis.store import read_provenance
 
 log = get_logger(__name__)

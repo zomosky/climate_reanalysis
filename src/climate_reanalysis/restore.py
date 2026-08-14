@@ -16,13 +16,13 @@ from pathlib import Path
 import numpy as np
 import xarray as xr
 
-from climate_reanalysis.archive import cold_path
 from climate_reanalysis.logging_setup import get_logger
 from climate_reanalysis.manifest import (
     iter_manifests,
     manifest_sha256,
     read_manifest,
 )
+from climate_reanalysis.paths import cold_path
 from climate_reanalysis.period import month_hours
 from climate_reanalysis.store import (
     TARGET_LAT,

@@ -49,6 +49,17 @@ def test_missing_expver_key_is_not_stale(tmp_path: Path):
     assert stale_months(tmp_path / "s", tmp_path / "m", dt.date(2027, 1, 1), 100) == []
 
 
+def test_boundary_exactly_after_days_is_not_yet_stale(tmp_path: Path):
+    """月末距今**正好等于** after_days 那天的边界：现有实现是 ``days <=
+    after_days`` 视为未过期，这里把这条边界行为钉死——202601 月末
+    （2026-01-31）+ 100 天 = 2026-05-11，当天还不过期；过了这天（次日）
+    才算过期。"""
+    _prov(tmp_path / "s", "202601", "t2m", ["0005"])
+    assert stale_months(tmp_path / "s", tmp_path / "m", dt.date(2026, 5, 11), 100) == []
+    assert stale_months(tmp_path / "s", tmp_path / "m", dt.date(2026, 5, 12), 100) == \
+        [("202601", "t2m")]
+
+
 def test_dry_run_deletes_nothing(tmp_path: Path):
     md, sd = tmp_path / "m", tmp_path / "s"
     _prov(sd, "202601", "t2m", ["0005"])

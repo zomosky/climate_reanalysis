@@ -136,9 +136,20 @@ def cmd_archive(args) -> int:
     显式 ``--yes`` 才真正搬运并清理热端。危险操作的另一面：这一步执行完，
     对应原始文件在热盘上就不存在了，只能靠冷端 + `restore` 自愈路径找回，
     不像 ``refresh``/``cleanup-jobs`` 删的是可重新生成的东西。
+
+    ``archive()`` 在前置条件不满足时会抛异常（``cold_dir`` 未配置、或
+    ``execute=True`` 时冷盘未通过挂载确认）——这里接住，打日志点名 + 返回
+    非零退出码，而不是让裸异常回溯冒出 ``main()``：CLI 调用方（cron/运维
+    脚本）看的是退出码和日志，不是 Python 栈回溯。
     """
     s = load_settings(args.config)
-    moved, skipped = archive(s.manifest_dir, s.store_dir, s.cold_dir, execute=args.yes)
+    try:
+        moved, skipped = archive(s.manifest_dir, s.store_dir, s.cold_dir, execute=args.yes)
+    except Exception as exc:  # noqa: BLE001 - 转成日志 + 非零退出码，不裸抛出 main()
+        log.error("archive_failed", error=str(exc),
+                 hint="检查 cold_dir 是否已配置、冷盘是否已挂载并放好哨兵文件"
+                      "（见 README「冷存归档」一节）")
+        return 2
     if not args.yes:
         log.info("archive_dry_run", would_move=moved, skipped=skipped,
                  hint="预览模式，未搬动任何文件；加 --yes 才会真正执行")

@@ -125,11 +125,24 @@ ERA5 有两种成色：**ERA5T 初步数据**（`expver=0005`，滞后约 5 天�
 后没有任何自动换新通路**——初步值写进去之后，除非手动介入，永远不会被替换成 final。
 
 `refresh` 补的就是这个通路。**它不去教 `download` 认得月库结构**——两个单元只通过
-manifest 通信，这是刻意保持的契约——而是把过期月份对应的 manifest **删掉**，让既有
-的 `download → restore` 流程自然把它们当成「没下过」重新走一遍：新下载产生新
-manifest，sha 与月库溯源里记的旧 sha 天然对不上，`restore` 就会按幂等规则重建那个
-变量。`refresh` 本身**不联网、不写任何新文件、不碰月库数据**，只做「找出过期月份」
-和「删 manifest」两件事。
+manifest 通信，这是刻意保持的契约——而是把过期月份对应的 manifest **连同原始文件
+一起删掉**，让既有的 `download → restore` 流程自然把它们当成「没下过」重新走一遍：
+新下载产生新 manifest，sha 与月库溯源里记的旧 sha 天然对不上，`restore` 就会按
+幂等规则重建那个变量。`refresh` 本身**不联网、不重新写任何数据**，`execute=True`
+时只删这两类「重下即可再生」的文件，绝不碰月库数据本身。
+
+**必须连原始文件一起删，只删 manifest 是不够的**：`download_one` 判断要不要真的
+发请求分两层——manifest 存在就整体早退，manifest 不存在则逐 CDS 变量看热端 raw
+文件在不在（`target.exists()`）决定要不要调用 CDS。早期实现只删了 manifest、
+留着 raw，第二层缓存判据会原封不动地命中同一份过期文件：`download_one` 在**零
+网络请求**的情况下把旧文件原样重新写进新 manifest（`completed_at` 变了、sha 因此
+也变，看起来像"处理过"），`restore` 因此重建出跟之前一模一样的初步数据——
+`refresh` 变成一次静默空转，日志照常打 `refresh_done`，但 `expver` 永远还是
+`0005`，永远刷不动。现在 `--yes` 会把 manifest 里记录的原始文件（热端 raw，
+若配置了 `cold_dir` 则连冷端副本也）一并删掉，删除顺序固定为**先 raw、后
+manifest**（manifest 是「已完整下载」的信号，必须最后消失——中途崩溃时留下
+"manifest 在但 raw 已删一部分"是 `restore` 能安全跳过的无害状态，反过来先删
+manifest 会留下无主的 raw 文件）。
 
 判据：该 (月, 变量) 的溯源 `expver` 里含 `"0005"`（哪怕只是跨边界月份的一部分），
 且该月月末距今已超过 `refresh_after_days` 天（出厂 100，留出比 final 实测 2–3 个月
@@ -141,16 +154,17 @@ manifest，sha 与月库溯源里记的旧 sha 天然对不上，`restore` 就�
 uv run climate_reanalysis refresh                              # 默认 dry-run：只打印清单，不删
 uv run climate_reanalysis refresh --after-days 60               # 覆盖配置里的 refresh_after_days
 uv run climate_reanalysis refresh --today 2026-06-01             # 覆盖“今天”，便于核对判据
-uv run climate_reanalysis refresh --yes                          # 确认清单无误后，加 --yes 才真删
+uv run climate_reanalysis refresh --yes                          # 确认清单无误后，加 --yes 才真删（manifest + 原始文件）
 ```
 
-**不加 `--yes` 是默认行为、不删任何文件**——删 manifest 会触发真实重下，代价是排队
-时间和带宽，必须先看清楚清单再决定。**`refresh --yes` 执行完之后，必须再手动跑一次
-`download` + `restore`**（`refresh` 自己不做这两步）：manifest 没了之后，`download`
-才会把这些 (月, 变量) 当成「没下过」重新发起真实 CDS 请求，`restore` 再把新结果
-（连带新的 `expver`）切回月库，完成真正的换新。这条通路与「raw 清理后月库损坏」
-一节里的手工恢复步骤是同一套底层机制（删 manifest → 触发 sha 不符 → 自然重建），
-`refresh` 只是把它包装成一个显式、可预览、按 ERA5T 判据自动找出目标的命令。
+**不加 `--yes` 是默认行为、不删任何文件**——删除会触发真实重下，代价是排队时间和
+带宽，必须先看清楚清单再决定。**`refresh --yes` 执行完之后，必须再手动跑一次
+`download` + `restore`**（`refresh` 自己不联网、不做这两步）：manifest 和 raw
+都没了之后，`download` 才会把这些 (月, 变量) 当成「没下过」重新发起真实 CDS
+请求，`restore` 再把新结果（连带新的 `expver`）切回月库，完成真正的换新。这条
+通路与「raw 清理后月库损坏」一节里的手工恢复步骤是同一套底层机制（删 manifest +
+raw → 触发 sha 不符 → 自然重建），`refresh` 只是把它包装成一个显式、可预览、按
+ERA5T 判据自动找出目标的命令。
 
 ## 冷存归档
 
@@ -197,10 +211,16 @@ shell 脚本**——因为 manifest 里本来就记着每个原始文件的 sha2
 
 **绝不修改 manifest 文件的内容**：manifest 的 sha256 是 `restore` 幂等判断的
 比对键，改它等于宣布对应月份需要重建。所以冷端位置**不写进 manifest**——
-`restore.load_raw` 找不到热端文件时，直接按 `cold_dir/<月份>/<原始文件名>`
-去冷端找（`archive.cold_path` 与 `restore._resolve` 共用同一条拼路径逻辑）；
-两处都没有才报错。`cold_dir` 为 `None`（未配置）时，这条回退不生效，行为与
-引入本功能之前完全一致。
+`restore._resolve` 找不到热端文件时，直接按 `cold_dir/<月份>/<原始文件名>`
+去冷端找（拼路径逻辑是 `paths.cold_path`，`archive` 与 `restore` 都从这个
+不依赖任何一方的公共模块 import，避免两边各自维护一份、或反过来互相依赖）；
+两处都没有才报错，报错信息会提示下一步——确认数据确实不在了就删掉对应
+manifest 触发重下。走冷端这条路径会打 `restore_cold_fallback` info 日志
+点名月份和文件（不出声的话，"已归档所以走冷端"和"热端被误删"这两种情况在
+日志里完全无法区分），并且会用 manifest 里记录的 sha256 校验冷端副本的
+完整性——冷端副本往往是放了很久的最后一份兜底数据，恰恰是最该验的一份，
+校验不通过就报错，不会把坏数据静默切进月库。`cold_dir` 为 `None`（未配置）
+时，这条回退不生效，行为与引入本功能之前完全一致。
 
 ### 命令用法
 
@@ -216,6 +236,28 @@ uv run climate_reanalysis archive --yes    # 确认统计无误后，加 --yes �
 不给任何看似无害的默认路径（本机/多数开发环境根本没有那块盘），必须在
 `config/settings.yaml` 里显式写清楚冷盘位置才能归档。服务器上按本仓库其它
 管线的冷盘约定，示例配成 `/save_data/climate_data/era5/raw`。
+
+### 冷盘挂载确认（哨兵文件）
+
+`--yes` 真正执行前，除了要求 `cold_dir` 已配置，还要求这个目录**已经存在、
+且下面有一个哨兵文件 `.climate_reanalysis_cold`**——缺一样都拒绝执行并报错
+（预览模式不做这个检查，因为预览完全不碰文件系统）。
+
+这不是多余的防呆：`cold_dir` 指向的挂载点在**没挂载**时，宿主机上通常表现为
+一个存在、可写的空目录（挂载失败本身不报错，只是没有内容）。如果 `archive`
+只检查"这个路径存不存在"，冷盘没挂上的时候就会在热盘（或根盘）上把整棵冷端
+目录树建出来，逐文件拷贝、算 sha 校验（同一块盘，内容天然一致，校验永远
+通过）、然后删掉热端——等真正的冷盘挂上，这份"冷端副本"被挂载点遮蔽，两边
+都找不到，数据就丢了。哨兵文件是运维在**确认挂载之后**手动放的信号，纯代码
+判断不出"挂载"这件事，只能靠这个替代：
+
+```bash
+# 确认冷盘已经挂载（df -h 或类似方式核实）之后，只需要做一次：
+touch /save_data/climate_data/era5/raw/.climate_reanalysis_cold
+```
+
+这个哨兵文件本身不参与任何判据（不会被当成待归档的原始文件），只是一个存在性
+标记；`cold_dir` 换了新盘/重新挂载后如果哨兵文件跟着丢了，需要重新 `touch` 一次。
 
 ### 月库丢失时的恢复路径
 
@@ -366,8 +408,9 @@ src/climate_reanalysis/
   download.py    单元 A：按（月×产出变量）下载并写 manifest
   restore.py     单元 B：scan-once 幂等切库
   migrate.py     单元 C：历史迁移，打 legacy 溯源
-  refresh.py     ERA5T 刷新：删过期月份的 manifest，交给 download+restore 自然重下 final
-  archive.py     冷存归档：下游已固化才搬、逐文件 sha 校验、先搬后删；restore 冷端回退共用 cold_path
+  refresh.py     ERA5T 刷新：删过期月份的 manifest + 原始文件，交给 download+restore 自然重下 final
+  archive.py     冷存归档：下游已固化才搬、逐文件 sha 校验、先搬后删、要求冷盘挂载哨兵
+  paths.py       cold_path()：archive/restore/refresh 三边共用的冷端路径拼接，不依赖任何单元
   cli.py         参数 → 调用的翻译层，不含业务逻辑
 tests/           零真实网络依赖，全量 ~10s
 ```

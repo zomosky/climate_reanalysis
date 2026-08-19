@@ -59,12 +59,11 @@ cp config/settings.yaml.example config/settings.yaml
 4.8 MB/s），部署服务器当前无代理（裸连 CDS 仅 10.6 KB/s）——只应通过
 `config/settings.yaml` 按机器区分。
 
-`.cdsapirc` 格式（CDS 官方标准，`url`/`key` 两行）：
-
-```
-url: https://cds.climate.copernicus.eu/api
-key: <your-key>
-```
+CDS 凭据：样例见 `config/cdsapirc.example`（CDS 官方标准格式，`url`/`key` 两行，
+key 从 CDS 个人页获取）。复制到 `~/.cdsapirc`，或复制为 `config/cdsapirc`
+（不入版本库）并在 `settings.yaml` 里 `cdsapirc: config/cdsapirc` 指过去。
+管线是**单账号**的：一次运行只用一份凭据；多账号轮换 = 各存一份 rc 文件、
+改 `cdsapirc` 指向切换，没有多账号并行。
 
 ## 月库目录结构（按年分层）
 

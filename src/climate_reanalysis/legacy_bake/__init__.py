@@ -12,8 +12,8 @@ tile 一次性烘成月度国网库，本项目的持续积累改为逐月直接
 ``climate_reanalysis.cli`` 的 ``bake-legacy`` 子命令，用法见 README「历史导入
 （一次性烘焙）」一节。
 
-设计见 climate_zrread/docs/superpowers/specs/2026-08-11-era5-reanalysis-source-design.md
-（原 solarcast 项目内的设计文档路径，供追溯历史背景）。
+月度国网库的读取契约由 climate_zrread 的 era5 观测源设计定义（内部设计稿，
+供追溯历史背景）。
 """
 
 from climate_reanalysis.legacy_bake.deconv import from_interval_centre

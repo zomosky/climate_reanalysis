@@ -9,7 +9,7 @@ ERA5 再分析的**持续积累**管线，与 `climate_pipeline` 里的 `downloa
 此后不再耦合。
 
 产出被 `climate_zrread` 的 `era5` 观测源直接消费（网格与 `ifs-hres` 逐格相同，
-契约见 `docs/superpowers/specs/2026-08-13-climate-reanalysis-pipeline-design.md`）。
+产出契约见下文「月库目录结构」一节）。
 
 ## 三个单元
 

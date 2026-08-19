@@ -1,6 +1,13 @@
 .venv/
 __pycache__/
 *.pyc
+.pytest_cache/
 config/settings.yaml
 data/
 .superpowers/
+
+# 模型提示词 / AI 会话工作文档,不进版本库
+CLAUDE.md
+.claude/
+HANDOFF.md
+docs/superpowers/

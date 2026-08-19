@@ -83,3 +83,16 @@ def test_cdsapirc_expands_home_but_is_not_project_anchored(tmp_path):
     assert s.cdsapirc == Path.home() / ".cdsapirc_zomosky"
     # 未落到项目根下
     assert tmp_path not in s.cdsapirc.parents
+
+
+def test_cdsapircs_pool_expands_home_and_defaults_empty(tmp_path):
+    """账号池 cdsapircs 同 cdsapirc 的路径语义：home 下的凭据文件，只展开 ~、
+    不锚定项目根。出厂空列表 = 单账号（用 cdsapirc）。"""
+    cfg = tmp_path / "config"
+    cfg.mkdir()
+    (cfg / "settings.yaml").write_text(
+        "cdsapircs:\n  - ~/.cdsapirc_a\n  - ~/.cdsapirc_b\n", encoding="utf-8")
+    s = load_settings(cfg / "settings.yaml")
+    assert s.cdsapircs == [Path.home() / ".cdsapirc_a", Path.home() / ".cdsapirc_b"]
+    assert all(tmp_path not in p.parents for p in s.cdsapircs)
+    assert Settings().cdsapircs == []

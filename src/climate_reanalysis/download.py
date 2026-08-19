@@ -118,10 +118,17 @@ def download_many(settings, client, months: list[str], variables: list[str],
     请求之前就把配置错误拦下来。
     """
     check_area_matches_grid(settings.area)
+    tasks = [(month, var) for month in months for var in variables]
+    return _download_tasks(settings, client, tasks, today)
+
+
+def _download_tasks(settings, client, tasks, today=None):
+    """单账号跑一批（月×变量）任务：``settings.concurrency`` 并发 + 收尾只清
+    本轮自己的失败 job。``download_many``/``download_many_accounts`` 的共用
+    主体——并发语义、失败隔离、清理作用域的完整说明见 ``download_many``。"""
     ok: list[tuple[str, str]] = []
     failed: list[tuple[str, str, str]] = []
     job_ids: list[str] = []
-    tasks = [(month, var) for month in months for var in variables]
     workers = max(1, settings.concurrency)
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = [pool.submit(_download_one_result, settings, client, month, var,
@@ -135,6 +142,39 @@ def download_many(settings, client, months: list[str], variables: list[str],
                 failed.append((month, var, payload))
             # kind == "skip"：未就绪，既不算成功也不算失败
     cleanup_failed_jobs(client, job_ids)
+    return ok, failed
+
+
+def download_many_accounts(settings, clients, months, variables,
+                           today: dt.date | None = None):
+    """账号池并行：把（月×变量）任务轮转分桶，每个账号各跑一条单账号流水
+    （各守 ``settings.concurrency`` 的排队上限、各自只清理自己本轮的失败 job）。
+    单账号（``clients`` 只有一个）时等价于 ``download_many``——CLI 无条件走
+    这个入口，不必按账号数分叉。
+
+    防单账号限流的思路承自 solarcast：每个 CDS 账号的排队大致半串行，两个
+    账号 ≈ 2 倍吞吐，当年靠多开进程、每进程 SOLARCAST_CDSAPIRC 指一个账号
+    实现，这里收拢成一次运行内的账号池。
+
+    **绝不共用一个大线程池**（N 账号 × concurrency 个 worker 混跑）：任务虽
+    在提交时就绑定了账号，但桶间快慢不均时，先清空的账号会把空闲 worker 全部
+    让给慢账号，单账号瞬时并发突破 concurrency——恰好触发 CDS 的 "queued
+    requests temporarily limited"（实测 8 并发整批先 accepted 后 rejected）。
+    每账号一个独立的内层线程池，上限才逐账号成立。
+    """
+    check_area_matches_grid(settings.area)
+    clients = list(clients)
+    tasks = [(month, var) for month in months for var in variables]
+    buckets = [tasks[i::len(clients)] for i in range(len(clients))]
+    ok: list[tuple[str, str]] = []
+    failed: list[tuple[str, str, str]] = []
+    with ThreadPoolExecutor(max_workers=len(clients)) as pool:
+        futures = [pool.submit(_download_tasks, settings, cl, bucket, today)
+                   for cl, bucket in zip(clients, buckets) if bucket]
+        for fut in futures:   # 按提交序收齐即可，账号间无先后语义
+            o, f = fut.result()
+            ok.extend(o)
+            failed.extend(f)
     return ok, failed
 
 

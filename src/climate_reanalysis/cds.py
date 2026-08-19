@@ -54,14 +54,29 @@ def _direct_session():
     return sess
 
 
-def make_client(settings):
-    """直连的 datastores client（submit/poll 不走代理）。"""
+def _make_client(rc: Path | None):
     import ecmwf.datastores
 
-    url, key = read_cdsapirc(settings.cdsapirc)
+    url, key = read_cdsapirc(rc)
     sess = _direct_session()
     return ecmwf.datastores.Client(url=url, key=key, session=sess,
                                    retry_after=60, maximum_tries=500)
+
+
+def make_client(settings):
+    """直连的 datastores client（submit/poll 不走代理）。"""
+    return _make_client(settings.cdsapirc)
+
+
+def make_clients(settings):
+    """账号池：``settings.cdsapircs`` 每份 rc 一个直连 client（顺序对应）；
+    空列表 = 单账号，退回 ``cdsapirc``——没配池的既有用法不受影响。
+
+    防单账号限流的思路承自 solarcast（多开进程、每进程 SOLARCAST_CDSAPIRC
+    指一个账号）；收拢进本项目后是一次运行内的进程内账号池，任务分发见
+    ``download.download_many_accounts``。"""
+    rcs = list(settings.cdsapircs) or [settings.cdsapirc]
+    return [_make_client(rc) for rc in rcs]
 
 
 def results_url(results) -> str:

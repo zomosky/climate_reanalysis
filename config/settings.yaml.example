@@ -37,3 +37,15 @@ publish_lag_days: 5
 # ERA5T 初步数据（expver=0005）换新窗口：月末再等这么多天才认为该月的初步值
 # 已经"过期"、该用 refresh 重新拉一遍 final（final 实测滞后 2-3 个月才发布）
 refresh_after_days: 100
+
+# CDS 凭据：留空 = ~/.cdsapirc。格式样例见 config/cdsapirc.example；
+# 复制为 config/cdsapirc（不入版本库）后在这里指过去：
+# cdsapirc: config/cdsapirc
+cdsapirc:
+
+# 账号池：配了非空列表就启用多账号并行下载——（月×变量）任务轮转分给各账号，
+# 每账号各守 concurrency 的排队上限，防止单账号被 CDS 限流（每个账号的排队
+# 大致半串行，两个账号 ≈ 2 倍吞吐）。不配/空 = 单账号（用上面的 cdsapirc）。
+# cdsapircs:
+#   - ~/.cdsapirc
+#   - ~/.cdsapirc_b

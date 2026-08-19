@@ -8,10 +8,11 @@
 #   2. 复制为 config/cdsapirc（不入版本库），并在 config/settings.yaml 里指定：
 #        cdsapirc: config/cdsapirc
 #
-# 管线是单账号的：一次运行只用一份凭据，concurrency 是同一账号上的请求
-# 排队重叠（出厂 4，别调高——见 README「download / restore 怎么调」）。
-# 有多个账号想轮换时，各存一份 rc 文件（如 ~/.cdsapirc_a、~/.cdsapirc_b），
-# 换账号 = 改 settings.yaml 的 cdsapirc 指向，不存在多账号并行逻辑。
+# 多账号并行：有多个账号时各存一份 rc 文件（如 ~/.cdsapirc_a、~/.cdsapirc_b），
+# 在 settings.yaml 的 cdsapircs 里列出即启用账号池——（月×变量）任务轮转分给
+# 各账号并行下载，每账号各守 concurrency 的排队上限（出厂 4，别调高——见
+# README「download / restore 怎么调」），防止单账号被 CDS 限流。
+# 只有一个账号就用上面的 cdsapirc 单数形式，不配 cdsapircs。
 
 url: https://cds.climate.copernicus.eu/api
 key: 00000000-0000-0000-0000-000000000000

@@ -484,3 +484,60 @@ def test_retrieve_records_submitted_job_id_when_tracked(monkeypatch, tmp_path: P
                 proxy=None, job_ids=ids)
 
     assert ids == ["req-42"]
+
+
+# --------------------------------------------------------------------------- #
+# make_clients：账号池的 client 工厂。防单账号限流的思路承自 solarcast（多开
+# 进程、每进程 SOLARCAST_CDSAPIRC 指一个账号）；收拢进本项目后是一次运行内
+# 每份 rc 一个 client。同 make_client 的手法打桩掉 Client 本身，零真实网络。
+# --------------------------------------------------------------------------- #
+def _stub_client_capture(monkeypatch):
+    import ecmwf.datastores
+    import requests
+
+    captured: list[dict] = []
+
+    class FakeSession:
+        def __init__(self):
+            self.trust_env = True
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            captured.append(kwargs)
+
+    monkeypatch.setattr(requests, "Session", FakeSession)
+    monkeypatch.setattr(ecmwf.datastores, "Client", FakeClient)
+    return captured
+
+
+def test_make_clients_builds_one_direct_client_per_account(monkeypatch, tmp_path: Path):
+    """每份 rc 一个 client、顺序对应；**每一个**都必须 trust_env=False 直连——
+    不能只有第一个享受这条约定（代理坑见模块 docstring）。"""
+    a = tmp_path / "rc_a"
+    a.write_text("url: https://cds.example.org/api\nkey: key-a\n")
+    b = tmp_path / "rc_b"
+    b.write_text("url: https://cds.example.org/api\nkey: key-b\n")
+    captured = _stub_client_capture(monkeypatch)
+
+    from climate_reanalysis.cds import make_clients
+
+    clients = make_clients(Settings(cdsapircs=[a, b]))
+
+    assert len(clients) == 2
+    assert [c["key"] for c in captured] == ["key-a", "key-b"]
+    assert all(c["session"].trust_env is False for c in captured)
+
+
+def test_make_clients_falls_back_to_single_cdsapirc(monkeypatch, tmp_path: Path):
+    """cdsapircs 为空 = 单账号：退回 cdsapirc，行为与 make_client 一致——
+    没配账号池的既有用法完全不受影响。"""
+    rc = tmp_path / "rc"
+    rc.write_text("url: https://cds.example.org/api\nkey: only\n")
+    captured = _stub_client_capture(monkeypatch)
+
+    from climate_reanalysis.cds import make_clients
+
+    clients = make_clients(Settings(cdsapirc=rc))
+
+    assert len(clients) == 1
+    assert captured[0]["key"] == "only"

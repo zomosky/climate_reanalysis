@@ -14,10 +14,10 @@ import sys
 from pathlib import Path
 
 from climate_reanalysis.archive import archive
-from climate_reanalysis.cds import make_client
+from climate_reanalysis.cds import make_clients
 from climate_reanalysis.download import (
     cleanup_account_failed_jobs,
-    download_many,
+    download_many_accounts,
     preview_account_failed_jobs,
 )
 from climate_reanalysis.legacy_bake.bake import bake as run_legacy_bake
@@ -59,7 +59,7 @@ def cmd_download(args) -> int:
     if not months:
         log.info("nothing_ready", start=args.start)
         return 0
-    ok, failed = download_many(s, make_client(s), months, variables, today)
+    ok, failed = download_many_accounts(s, make_clients(s), months, variables, today)
     log.info("download_done", ok=len(ok), failed=len(failed))
     return 1 if failed else 0
 
@@ -112,18 +112,25 @@ def cmd_cleanup_jobs(args) -> int:
     """
     s = load_settings(args.config)
     statuses = tuple(args.statuses) if args.statuses else ("failed", "rejected")
-    client = make_client(s)
+    # 账号池下逐账号清理（同 solarcast 的 clean_cds_jobs 遍历 ACCOUNTS）；
+    # 没配池 = 只有 cdsapirc 一个账号，行为与从前一致
+    clients = make_clients(s)
+    labels = [str(rc) if rc else "~/.cdsapirc"
+              for rc in (list(s.cdsapircs) or [s.cdsapirc])]
     if not args.yes:
-        preview = preview_account_failed_jobs(client, statuses)
         total = 0
-        for status, ids in preview.items():
-            total += len(ids)
-            log.info("cleanup_jobs_preview", status=status, count=len(ids),
-                     sample=ids[:5])
+        for label, client in zip(labels, clients):
+            preview = preview_account_failed_jobs(client, statuses)
+            for status, ids in preview.items():
+                total += len(ids)
+                log.info("cleanup_jobs_preview", account=label, status=status,
+                         count=len(ids), sample=ids[:5])
         log.info("cleanup_jobs_dry_run", total=total,
                  hint="预览模式，未删除任何 job；加 --yes 才会真正执行")
         return 0
-    n = cleanup_account_failed_jobs(client, statuses)
+    n = 0
+    for label, client in zip(labels, clients):
+        n += cleanup_account_failed_jobs(client, statuses)
     log.info("cleanup_jobs_done", count=n)
     return 0
 

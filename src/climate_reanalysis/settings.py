@@ -39,6 +39,11 @@ class Settings(BaseModel):
     #: 指定 .cdsapirc；None = ~/.cdsapirc。按惯例是 home 下的凭据文件，故与上面三个
     #: 数据路径不同：不锚定项目根，只做 ~ 展开（多账号轮换时写 ~/.cdsapirc_xxx）
     cdsapirc: Path | None = None
+    #: 账号池：多份 .cdsapirc，非空即启用多账号并行下载——（月×变量）任务轮转
+    #: 分给各账号，每账号各守 concurrency 的排队上限，防单账号被 CDS 限流（思路
+    #: 承自 solarcast：每个账号的排队大致半串行，两个账号 ≈ 2 倍吞吐）。路径语义
+    #: 同 cdsapirc：只展开 ~、不锚定项目根。空列表 = 单账号（用上面的 cdsapirc）
+    cdsapircs: list[Path] = []
 
 
 def _anchor(base: Path, p: Path) -> Path:
@@ -70,5 +75,6 @@ def load_settings(path: Path | None = None) -> Settings:
             "store_dir": _anchor(base, s.store_dir),
             "cold_dir": _anchor(base, s.cold_dir) if s.cold_dir else None,
             "cdsapirc": s.cdsapirc.expanduser() if s.cdsapirc else None,
+            "cdsapircs": [p.expanduser() for p in s.cdsapircs],
         }
     )

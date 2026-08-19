@@ -50,7 +50,8 @@ cp config/settings.yaml.example config/settings.yaml
 | `refresh_after_days` | ERA5T 初步数据换新窗口（天），出厂 100——月末再等这么多天才认为初步值「过期」，见下方「ERA5T 刷新」 |
 | `cold_dir` | 冷盘归档根目录；留空（出厂 `None`）= 未配置，`archive` 拒绝执行，见下方「冷存归档」 |
 | `area` | 请求区域 `(N, W, S, E)`，需与产出网格 15–55N / 70–140E 一致 |
-| `cdsapirc` | 指定 `.cdsapirc` 路径；留空 = `~/.cdsapirc`（多账号轮换时可另起一份） |
+| `cdsapirc` | 指定 `.cdsapirc` 路径；留空 = `~/.cdsapirc` |
+| `cdsapircs` | 账号池：多份 `.cdsapirc` 路径，非空即启用多账号并行下载；空/不配 = 单账号（用 `cdsapirc`） |
 
 `raw_dir`/`manifest_dir`/`store_dir` 的相对路径锚定到 `config/` 的**父目录**（即项目根），
 不是运行时的 CWD——在哪个目录下敲 `uv run` 都一样。
@@ -62,8 +63,12 @@ cp config/settings.yaml.example config/settings.yaml
 CDS 凭据：样例见 `config/cdsapirc.example`（CDS 官方标准格式，`url`/`key` 两行，
 key 从 CDS 个人页获取）。复制到 `~/.cdsapirc`，或复制为 `config/cdsapirc`
 （不入版本库）并在 `settings.yaml` 里 `cdsapirc: config/cdsapirc` 指过去。
-管线是**单账号**的：一次运行只用一份凭据；多账号轮换 = 各存一份 rc 文件、
-改 `cdsapirc` 指向切换，没有多账号并行。
+
+**多账号并行**（防单账号限流，思路承自 solarcast）：有多个账号时各存一份 rc
+文件，在 `cdsapircs` 里列出即启用账号池——（月×变量）任务轮转分给各账号并行
+下载，**每账号各守 `concurrency` 的排队上限**、各自清理自己本轮的失败 job；
+`cleanup-jobs` 也会逐账号预览/清理。每个 CDS 账号的排队大致半串行，两个账号
+≈ 2 倍吞吐。只有一个账号就用 `cdsapirc` 单数形式。
 
 ## 月库目录结构（按年分层）
 

@@ -12,6 +12,7 @@ import pytest
 from climate_reanalysis.download import (
     build_request,
     download_many,
+    download_many_accounts,
     download_one,
     raw_path,
 )
@@ -356,3 +357,121 @@ def test_concurrent_failure_does_not_affect_others(monkeypatch, tmp_path: Path):
     assert not manifest_path(s.manifest_dir, "202601", "t2m").exists()
     for v in ("sp", "d2m", "u100"):
         assert manifest_path(s.manifest_dir, "202601", v).exists()
+
+
+# --------------------------------------------------------------------------- #
+# 账号池（download_many_accounts）：solarcast 时代靠多开进程、每进程一个
+# SOLARCAST_CDSAPIRC 指向不同账号来拆队列（每账号的排队大致半串行，两个账号
+# ≈ 2 倍吞吐）；这里收拢成进程内账号池。契约：任务轮转分桶、每账号各守自己的
+# concurrency 上限（绝不共用一个大线程池——桶间快慢不均时空闲 worker 会全部
+# 涌向同一账号，单账号瞬时并发突破上限，恰好触发 CDS 的 "queued requests
+# temporarily limited"，实测 8 并发整批 rejected）、失败与收尾清理以账号为界。
+# --------------------------------------------------------------------------- #
+def test_accounts_split_tasks_round_robin(monkeypatch, tmp_path: Path):
+    s = _settings(tmp_path)
+    a, b = FakeClient(), FakeClient()
+    _fake_retrieve(monkeypatch, a)   # 桩用的是调用时传入的 cl，一个桩服务所有账号
+    ok, failed = download_many_accounts(s, [a, b], ["202601"],
+                                        ["t2m", "sp", "d2m", "u100"], TODAY)
+
+    assert not failed and len(ok) == 4
+    assert len(a.requests) == 2 and len(b.requests) == 2   # 均分
+    got = {r[1]["variable"][0] for r in a.requests} \
+        | {r[1]["variable"][0] for r in b.requests}
+    assert got == {"2m_temperature", "surface_pressure",
+                   "2m_dewpoint_temperature", "100m_u_component_of_wind"}  # 不重不漏
+    for v in ("t2m", "sp", "d2m", "u100"):
+        assert manifest_path(s.manifest_dir, "202601", v).exists()
+
+
+def test_accounts_each_keep_their_own_concurrency_cap(monkeypatch, tmp_path: Path):
+    """单账号的并发上限在账号池下必须逐账号成立——这是不共用大线程池的原因。
+    同时断言总峰值超过单账号上限，证明账号之间真的并行过（否则池化毫无意义、
+    测试也可能因巧合退化成顺序而假阳性）。"""
+    s = Settings(raw_dir=tmp_path / "raw", manifest_dir=tmp_path / "m",
+                store_dir=tmp_path / "s", dl_proxy=None, concurrency=2)
+    lock = threading.Lock()
+    per: dict[int, dict] = {}
+    total = {"current": 0, "peak": 0}
+
+    def rv(cl, dataset, request, target, proxy, attempts=6, job_ids=None):
+        st = per.setdefault(id(cl), {"current": 0, "peak": 0})
+        with lock:
+            st["current"] += 1
+            st["peak"] = max(st["peak"], st["current"])
+            total["current"] += 1
+            total["peak"] = max(total["peak"], total["current"])
+        time.sleep(0.05)
+        with lock:
+            st["current"] -= 1
+            total["current"] -= 1
+        Path(target).parent.mkdir(parents=True, exist_ok=True)
+        Path(target).write_bytes(b"nc")
+        return Path(target)
+
+    monkeypatch.setattr("climate_reanalysis.download.retrieve", rv)
+    a, b = FakeClient(), FakeClient()
+    variables = ["t2m", "sp", "d2m", "u100", "v100", "fdir"]   # 每账号分到 3 个
+    download_many_accounts(s, [a, b], ["202601"], variables, TODAY)
+
+    assert len(per) == 2
+    assert all(st["peak"] <= 2 for st in per.values())   # 硬约束：单账号绝不超上限
+    assert total["peak"] > 2                             # 账号之间真的并行过
+
+
+def test_accounts_cleanup_is_scoped_per_account(monkeypatch, tmp_path: Path):
+    """收尾清理以账号为界：每个账号只清自己本轮 submit 的 job id——把 A 账号的
+    id 拿去 B 账号上清，轻则空转，重则误删 B 上正跑着的别的批次。"""
+    s = _settings(tmp_path)
+    a, b = FakeClient(), FakeClient()
+    _fake_retrieve(monkeypatch, a)
+    calls: list[tuple[object, list[str]]] = []
+    monkeypatch.setattr("climate_reanalysis.download.cleanup_failed_jobs",
+                        lambda client, job_ids: calls.append((client, list(job_ids))))
+    download_many_accounts(s, [a, b], ["202601"], ["t2m", "sp"], TODAY)
+
+    assert len(calls) == 2
+    by_client = {id(c): ids for c, ids in calls}
+    assert by_client[id(a)] == ["job-2m_temperature"]
+    assert by_client[id(b)] == ["job-surface_pressure"]
+
+
+def test_accounts_failure_stays_within_its_account(monkeypatch, tmp_path: Path):
+    """失败隔离跨账号同样成立：一个账号上的一个变量失败，不影响它自己的其它
+    任务，更不影响别的账号。"""
+    s = _settings(tmp_path)
+    a = FakeClient(fail_on={"2m_temperature"})
+    b = FakeClient()
+    _fake_retrieve(monkeypatch, a)
+    ok, failed = download_many_accounts(s, [a, b], ["202601"],
+                                        ["t2m", "sp", "d2m", "u100"], TODAY)
+
+    assert [f[1] for f in failed] == ["t2m"]
+    assert sorted(o[1] for o in ok) == ["d2m", "sp", "u100"]
+
+
+def test_accounts_single_client_is_equivalent_to_download_many(monkeypatch, tmp_path: Path):
+    """账号池退化到一个账号时行为与 download_many 一致——CLI 可以无条件走
+    账号池入口，不必按账号数分叉。"""
+    s = _settings(tmp_path)
+    c = FakeClient()
+    _fake_retrieve(monkeypatch, c)
+    ok, failed = download_many_accounts(s, [c], ["202601"], ["t2m", "sp"], TODAY)
+
+    assert not failed and len(ok) == 2
+    for v in ("t2m", "sp"):
+        assert manifest_path(s.manifest_dir, "202601", v).exists()
+
+
+def test_accounts_reject_area_that_drifted_from_grid(monkeypatch, tmp_path: Path):
+    """启动期的 area 校验在账号池入口同样要拦——一个请求都不能发出去。"""
+    s = Settings(raw_dir=tmp_path / "raw", manifest_dir=tmp_path / "m",
+                store_dir=tmp_path / "s", dl_proxy=None,
+                area=(55.0, 70.0, 16.0, 140.0))
+    a, b = FakeClient(), FakeClient()
+    _fake_retrieve(monkeypatch, a)
+
+    with pytest.raises(ValueError, match="网格"):
+        download_many_accounts(s, [a, b], ["202601"], ["t2m"], TODAY)
+
+    assert a.requests == [] and b.requests == []

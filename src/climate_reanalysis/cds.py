@@ -126,7 +126,7 @@ def _expected_size(url: str, proxy: str | None) -> int | None:
 
 
 def curl_download(url: str, target: Path, proxy: str | None,
-                  attempts: int = 8) -> None:
+                  attempts: int = 8, *, strict_size: bool = False) -> None:
     """可续传下载。``-C -`` 使断掉的传输接着传而不是重来。
 
     curl 返回码 0 不代表文件完整（见 ``_expected_size`` 的注释）——下载完
@@ -145,6 +145,8 @@ def curl_download(url: str, target: Path, proxy: str | None,
     target.parent.mkdir(parents=True, exist_ok=True)
     part = target.parent / f"{target.name}.part"
     expected = _expected_size(url, proxy)   # 只探测一次，url 在各次尝试间不变
+    if strict_size and (expected is None or expected <= 0):
+        raise ValueError("remote size unavailable; refusing unchecked managed download")
     for i in range(1, attempts + 1):
         cmd = ["curl", "-sSL", "-C", "-", "--retry", "3", "--retry-delay", "5",
                "--retry-all-errors", "--connect-timeout", "30", "--fail"]
@@ -153,7 +155,8 @@ def curl_download(url: str, target: Path, proxy: str | None,
         cmd += ["-o", str(part), url]
         r = subprocess.run(cmd)
         have = part.stat().st_size if part.exists() else 0
-        if r.returncode == 0 and (expected is None or have >= expected):
+        size_ok = expected is None or (have == expected if strict_size else have >= expected)
+        if r.returncode == 0 and size_ok:
             os.replace(part, target)   # target 出现即代表完整，不会有中间态
             return
         if r.returncode == 0:

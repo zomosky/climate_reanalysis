@@ -11,6 +11,19 @@ ERA5 再分析的**持续积累**管线，与 `climate_pipeline` 里的 `downloa
 产出被 `climate_zrread` 的 `era5` 观测源直接消费（网格与 `ifs-hres` 逐格相同，
 产出契约见下文「月库目录结构」一节）。
 
+## 持久化生产入口（2026-09-09）
+
+新增 `sync --start YYYYMM [--refresh]`：保存 CDS 任务 ID 和阶段，支持失败退避、
+候选全月校验和不可变版本发布。`status` 输出可供调度/监控读取的 JSON。
+ERA5T 换新保留旧 raw 和月库，下载验证完成后才原子切换发布索引。
+
+完整命令、状态协议、目录、人工恢复及 241 包装脚本见
+[持久化更新与版本发布](docs/durable-pipeline.md)。读取端应使用支持
+`publication.json` 的 `climate_zrread`；Watcher 查询缓存也需同步对应版本。
+
+下面 `download/restore/refresh/archive` 等为传统目录模式的独立命令说明。
+进入 `sync` 托管后，这些旧命令的写操作会被拒绝，防止原地写绕过版本发布。
+
 ## 三个单元
 
 | 命令 | 作用 |

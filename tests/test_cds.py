@@ -541,3 +541,21 @@ def test_make_clients_falls_back_to_single_cdsapirc(monkeypatch, tmp_path: Path)
 
     assert len(clients) == 1
     assert captured[0]["key"] == "only"
+
+
+def test_managed_download_requires_remote_size(monkeypatch,tmp_path):
+    _stub_head(monkeypatch)
+    monkeypatch.setattr(subprocess,'run',lambda *_a,**_k:pytest.fail('no unchecked transfer'))
+    with pytest.raises(ValueError,match='size unavailable'):
+        curl_download('https://obj/x',tmp_path/'out',None,strict_size=True)
+
+
+def test_legacy_size_acceptance_is_unchanged(monkeypatch,tmp_path):
+    _stub_head(monkeypatch,content_length=4)
+    def transfer(cmd,**kw):
+        Path(cmd[cmd.index('-o')+1]).write_bytes(b'12345')
+        return SimpleNamespace(returncode=0)
+    monkeypatch.setattr(subprocess,'run',transfer)
+    curl_download('https://obj/x',tmp_path/'legacy',None,attempts=1)
+    with pytest.raises(RuntimeError):
+        curl_download('https://obj/x',tmp_path/'managed',None,attempts=1,strict_size=True)

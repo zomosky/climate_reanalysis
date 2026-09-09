@@ -9,7 +9,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import yaml
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class Settings(BaseModel):
@@ -29,6 +29,10 @@ class Settings(BaseModel):
     dl_proxy: str | None = None
     #: 每期并发下载的变量数。链路退化（日志频现 curl rc=18）时调低到 1-2
     concurrency: int = 4
+    #: sync 同时推进的月份数；每个账号仍受 concurrency 限制。
+    max_active_months: int = Field(default=2, ge=1)
+    retry_hours: int = Field(default=1, ge=1)
+    final_retry_days: int = Field(default=7, ge=1)
     #: ERA5 发布延迟：月末再等这么多天才认为该月齐全（实测 T-5 可得、T-3 不可得）
     publish_lag_days: int = 5
     #: ERA5T 初步数据换新窗口：月末再等这么多天才认为该月的初步值（expver=0005）

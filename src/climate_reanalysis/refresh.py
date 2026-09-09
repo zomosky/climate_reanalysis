@@ -126,6 +126,9 @@ def refresh(
     走过 download 的历史月）静默跳过，不计入"实际删除"的返回值，也不报错——
     没有 manifest 可删本身不是错误。
     """
+    if execute:
+        from climate_reanalysis.publication import refuse_legacy_write
+        refuse_legacy_write(store_dir)
     stale = stale_months(store_dir, manifest_dir, today, after_days)
     if not execute:
         return stale

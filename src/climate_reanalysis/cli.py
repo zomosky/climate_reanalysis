@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import sys
+import json
 from pathlib import Path
 
 from climate_reanalysis.archive import archive
@@ -197,6 +198,42 @@ def cmd_list_variables(args) -> int:
     return 0
 
 
+def cmd_sync(args):
+    from climate_reanalysis.pipeline import sync
+    from climate_reanalysis.state import PipelineBusy
+    try:
+        result = sync(load_settings(args.config), args.start, refresh=args.refresh)
+    except PipelineBusy:
+        log.info('sync_skipped', reason='producer_lock_held')
+        return 0
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 1 if result['failed'] else 0
+
+
+def cmd_status(args):
+    from climate_reanalysis.pipeline import status
+    print(json.dumps(status(load_settings(args.config)), ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_attach(args):
+    from climate_reanalysis.pipeline import attach_job
+    attach_job(load_settings(args.config), args.month, args.variable, args.request_id)
+    return 0
+
+
+def cmd_retry_submission(args):
+    from climate_reanalysis.pipeline import retry_submission
+    retry_submission(load_settings(args.config), args.month, args.variable)
+    return 0
+
+
+def cmd_retry_task(args):
+    from climate_reanalysis.pipeline import retry_task
+    retry_task(load_settings(args.config), args.month, redownload=args.redownload)
+    return 0
+
+
 def main(argv=None) -> int:
     configure()
     p = argparse.ArgumentParser(prog="climate_reanalysis")
@@ -207,6 +244,29 @@ def main(argv=None) -> int:
         "否则报错——避免 typo 静默用错配置、表现成'处理 0 个、退出码 0'"
     ))
     sub = p.add_subparsers(dest="cmd", required=True)
+
+    managed = sub.add_parser("sync", help="持久化单趟补新、续跑及安全发布")
+    managed.add_argument("--start", required=True, help="托管补新起始月份 YYYYMM")
+    managed.add_argument("--refresh", action="store_true", help="同时计划过期 ERA5T 换新；保留旧 raw/月库")
+    managed.set_defaults(func=cmd_sync)
+    status_cmd = sub.add_parser("status", help="只读 JSON 任务阶段、重试和发布索引")
+    status_cmd.set_defaults(func=cmd_status)
+    attach = sub.add_parser("attach-job", help="核对 CDS 回执后关联提交结果不明确的任务")
+    attach.add_argument("--month", required=True)
+    attach.add_argument("--variable", required=True, help="CDS 原始变量名")
+    attach.add_argument("--request-id", required=True)
+    attach.set_defaults(func=cmd_attach)
+
+    retry = sub.add_parser("retry-submission", help="人工确认 CDS 无对应任务后重试不明确的提交")
+    retry.add_argument("--month", required=True)
+    retry.add_argument("--variable", required=True)
+    retry.add_argument("--confirm-no-remote-job", action="store_true", required=True)
+    retry.set_defaults(func=cmd_retry_submission)
+
+    retry_task = sub.add_parser("retry-task", help="重建失败候选库；可选择新一轮下载，保留旧尝试")
+    retry_task.add_argument("--month", required=True)
+    retry_task.add_argument("--redownload", action="store_true")
+    retry_task.set_defaults(func=cmd_retry_task)
 
     d = sub.add_parser("download", help="按（月×产出变量）下载并写 manifest")
     d.add_argument("--start", required=True, help=(
@@ -287,6 +347,15 @@ def main(argv=None) -> int:
 
     args = p.parse_args(argv)
     args.config = _resolve_config_path(args.config)
+    if args.cmd in {"download", "restore", "refresh", "migrate", "bake-legacy", "archive"}:
+        from climate_reanalysis.publication import refuse_legacy_write
+        settings = load_settings(args.config)
+        root = getattr(args, "out", None) or settings.store_dir
+        # Legacy commands retain their independent download/restore behavior.
+        # First adoption of sync requires stopping existing legacy producers.
+        mutates = args.cmd not in {"refresh", "archive"} or args.yes
+        if mutates:
+            refuse_legacy_write(root)
     return args.func(args)
 
 

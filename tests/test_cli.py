@@ -455,3 +455,32 @@ def test_archive_returns_zero_when_everything_is_already_archived(tmp_path, caps
     # structlog 会在键与值之间插 ANSI 颜色码，先剥掉再断言
     out = re.sub(r"\x1b\[[0-9;]*m", "", capsys.readouterr().out)
     assert "already=1" in out and "failed=0" in out and "moved=0" in out
+
+
+def test_status_is_json_and_does_not_create_state(tmp_path,capsys):
+    import json
+    cfg=_settings_yaml(tmp_path)
+    assert cli.main(['--config',str(cfg),'status']) == 0
+    payload=json.loads(capsys.readouterr().out)
+    assert payload['tasks'] == {}
+    assert not (tmp_path/'store').exists()
+
+
+def test_sync_future_start_needs_no_credentials(tmp_path,monkeypatch):
+    cfg=_settings_yaml(tmp_path)
+    monkeypatch.setattr('climate_reanalysis.jobs.make_accounts',_forbid_network)
+    assert cli.main(['--config',str(cfg),'sync','--start','209901']) == 0
+
+
+def test_retry_submission_requires_explicit_absence_confirmation():
+    with pytest.raises(SystemExit):
+        cli.main(['retry-submission','--month','202608','--variable','2m_temperature'])
+
+
+def test_legacy_download_does_not_require_store_mount(tmp_path,monkeypatch):
+    cfg=_settings_yaml(tmp_path)
+    # Legacy download only needs raw/manifest locations; its future no-op must
+    # work even when the external store destination is unavailable for writes.
+    (tmp_path/'store').write_text('not a mounted data directory')
+    monkeypatch.setattr('climate_reanalysis.cli.make_clients',_forbid_network)
+    assert cli.main(['--config',str(cfg),'download','--start','209901']) == 0

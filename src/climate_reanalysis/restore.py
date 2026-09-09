@@ -176,6 +176,8 @@ def load_raw(
 
 def restore_one(settings, manifest_file: Path) -> str:
     """处理一份 manifest。返回 ``"done"``（已重建）或 ``"skip"``（溯源一致）。"""
+    from climate_reanalysis.publication import refuse_legacy_write
+    refuse_legacy_write(settings.store_dir)
     manifest_file = Path(manifest_file)
     d = read_manifest(manifest_file)
     month, var = d["period"], d["variable"]

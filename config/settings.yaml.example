@@ -31,6 +31,11 @@ dl_proxy:
 # 链路退化时（日志频现 curl rc=18）调低到 1-2
 concurrency: 4
 
+# sync 持久化调度：最多同时推进的月份、失败退避起点、仍为 ERA5T 时再尝试的间隔。
+max_active_months: 2
+retry_hours: 1
+final_retry_days: 7
+
 # ERA5 发布延迟：月末再等这么多天才认为该月齐全
 publish_lag_days: 5
 

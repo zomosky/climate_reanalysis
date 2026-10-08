@@ -36,6 +36,14 @@ max_active_months: 2
 retry_hours: 1
 final_retry_days: 7
 
+# 提交结果不明时自动核对原账号：每 10 分钟完整查询一次；至少等 30 分钟，
+# 连续至少两次完整查询都没有匹配请求才重提。查询失败/匹配不唯一不会重提。
+submission_reconcile_interval_minutes: 10
+submission_reconcile_grace_minutes: 30
+submission_reconcile_absence_checks: 2
+# 每次最多查 20 页（每页 100 个请求）；达到上限仍未查完时保留暂停状态。
+submission_reconcile_max_pages: 20
+
 # ERA5 发布延迟：月末再等这么多天才认为该月齐全
 publish_lag_days: 5
 

@@ -33,6 +33,15 @@ class Remote:
         self.request_id = id
         self.request = request
         self.status = status
+        from climate_reanalysis.download import DATASET
+        self.collection_id = DATASET
+        self.created_at = NOW
+
+    @property
+    def json(self):
+        return {'processID': self.collection_id, 'status': self.status,
+                'created': self.created_at.isoformat(),
+                'metadata': {'request': {'ids': self.request}}}
 
     def get_results(self):
         return SimpleNamespace(asset={'href': self.request_id})
@@ -44,6 +53,14 @@ class Account:
         self.submits = 0
         self.resumes = []
         self.initial = initial
+        self.list_calls = 0
+
+    def get_jobs(self, **kwargs):
+        self.list_calls += 1
+        return SimpleNamespace(json={'jobs': [
+            {'jobID': r.request_id, 'processID': r.collection_id,
+             'created': r.created_at.isoformat()}
+            for r in self.remotes.values()]}, next=None)
 
     def submit(self, dataset, request):
         self.submits += 1
@@ -123,7 +140,7 @@ def test_transfer_failure_retains_id_and_retry_time(setup, fake):
     assert fake[0].submits == 10  # no second submit for interrupted transfer
 
 
-def test_uncertain_submit_does_not_automatically_resubmit(setup, fake, monkeypatch):
+def test_uncertain_submit_not_resubmitted_after_one_absence_check(setup, fake, monkeypatch):
     def lost_reply(*args):
         fake[0].submits += 1
         raise OSError('reply lost')
@@ -131,7 +148,8 @@ def test_uncertain_submit_does_not_automatically_resubmit(setup, fake, monkeypat
     assert tick(setup, fake)['failed'] == 1
     later = tick(setup, fake, now=NOW+timedelta(hours=2))
     assert fake[0].submits == 1
-    assert 'attach-job' in later['tasks']['202608']['last_error']
+    job = next(iter(later['tasks']['202608']['jobs'].values()))
+    assert job['status'] == 'submitting' and job['reconciliation']['absent_checks'] == 1
 
 
 def test_refresh_keeps_old_version_until_final_validated(setup, fake):
@@ -367,3 +385,338 @@ def test_remote_status_404_marks_deleted_for_retry(setup,fake):
     result=tick(setup,fake)
     job=next(iter(result['tasks']['202608']['jobs'].values()))
     assert job['status'] == 'deleted'
+
+
+def test_lost_submit_reply_recovers_matching_job_on_second_page(setup, fake, monkeypatch):
+    """Remote acceptance survives a lost reply; resume it through publication."""
+    submit = fake[0].submit
+    lost = {'once': True}
+    def lose_reply(dataset, request):
+        remote = submit(dataset, request)
+        if lost['once']:
+            lost['once'] = False
+            raise OSError('reply lost')
+        return remote
+    monkeypatch.setattr(fake[0], 'submit', lose_reply)
+    first = tick(setup, fake)
+    assert first['failed'] == 1
+    page2 = fake[0].get_jobs()
+    monkeypatch.setattr(fake[0], 'get_jobs', lambda **kw:
+                        SimpleNamespace(json={'jobs': []}, next=page2))
+    result = tick(setup, fake, now=NOW+timedelta(minutes=10))
+    assert result['counts'] == {'complete': 1}
+    assert fake[0].submits == 10  # no duplicate of the accepted first request
+    task = result['tasks']['202608']
+    job = next(iter(task['jobs'].values()))
+    assert job['request_id'] == '1'
+    assert job['reconciliation']['outcome'] == 'attached'
+    assert publication.validate_month(publication.resolve_month(setup.store_dir, '202608'),
+                                      '202608', {})['hours'] == 744
+
+
+def test_absent_last_submit_retries_after_grace_without_redownloading(setup, fake, monkeypatch):
+    """The actual incident: keep nine files, recover only the missing tenth."""
+    submit = fake[0].submit
+    def absent_once(dataset, request):
+        if fake[0].submits == 9:
+            fake[0].submits += 1
+            raise OSError('connection failed before acceptance')
+        return submit(dataset, request)
+    monkeypatch.setattr(fake[0], 'submit', absent_once)
+    first = tick(setup, fake)
+    kept = {n: dict(j) for n,j in first['tasks']['202608']['jobs'].items()
+            if j['status'] == 'downloaded'}
+    assert len(kept) == 9
+    for minutes in (10, 20):
+        result = tick(setup, fake, now=NOW+timedelta(minutes=minutes))
+        assert fake[0].submits == 10 and result['publication_revision'] is None
+    result = tick(setup, fake, now=NOW+timedelta(minutes=30))
+    assert result['counts'] == {'complete': 1} and fake[0].submits == 11
+    task = result['tasks']['202608']
+    assert all(task['jobs'][n] == j for n,j in kept.items())
+    last = task['jobs']['10m_v_component_of_wind']
+    assert last['submission_recoveries'][-1]['outcome'] == 'confirmed_absent'
+
+
+def test_lookup_failure_never_counts_as_absence_or_leaks_secrets(setup, fake, monkeypatch):
+    monkeypatch.setattr(fake[0], 'submit', lambda *_: (_ for _ in ()).throw(OSError()))
+    tick(setup, fake)
+    monkeypatch.setattr(fake[0], 'get_jobs', lambda **kw:
+                        (_ for _ in ()).throw(OSError('https://secret?token=private')))
+    result = tick(setup, fake, now=NOW+timedelta(hours=2))
+    task = result['tasks']['202608']
+    job = next(iter(task['jobs'].values()))
+    assert job['status'] == 'submitting'
+    assert job['reconciliation']['absent_checks'] == 0
+    assert 'lookup failed' in task['last_error']
+    assert 'secret' not in json.dumps(result) and 'private' not in json.dumps(result)
+
+
+def _uncertain_first(setup, fake, monkeypatch, *, accepted=False):
+    submit = fake[0].submit
+    once = {'fail': True}
+    def lose_reply(dataset, request):
+        if once['fail']:
+            once['fail'] = False
+            if accepted:
+                submit(dataset, request)
+            else:
+                fake[0].submits += 1
+            raise OSError('connection lost')
+        return submit(dataset, request)
+    monkeypatch.setattr(fake[0], 'submit', lose_reply)
+    tick(setup, fake)
+    return next(iter(Journal.read(setup.store_dir)['tasks']['202608']['jobs']))
+
+
+def test_ambiguous_receipts_pause_until_unique_without_new_post(setup, fake, monkeypatch):
+    name = _uncertain_first(setup, fake, monkeypatch, accepted=True)
+    fake[0].remotes['other'] = Remote('other', fake[0].remotes['1'].request)
+    for minutes in (10, 20, 120):
+        result = tick(setup, fake, now=NOW+timedelta(minutes=minutes))
+        job = result['tasks']['202608']['jobs'][name]
+        assert job['status'] == 'submitting'
+        assert job['reconciliation']['outcome'] == 'ambiguous'
+        assert 'multiple matching' in result['tasks']['202608']['last_error']
+        assert fake[0].submits == 1 and result['publication_revision'] is None
+    del fake[0].remotes['other']
+    assert tick(setup, fake, now=NOW+timedelta(minutes=130))['counts'] == {'complete': 1}
+    assert fake[0].submits == 10
+
+
+def test_match_before_failed_next_page_is_not_attached(setup, fake, monkeypatch):
+    name = _uncertain_first(setup, fake, monkeypatch, accepted=True)
+    page = fake[0].get_jobs()
+    class BrokenPagination:
+        json = page.json
+        @property
+        def next(self):
+            raise OSError('later page failed')
+    monkeypatch.setattr(fake[0], 'get_jobs', lambda **kw: BrokenPagination())
+    result = tick(setup, fake, now=NOW+timedelta(hours=2))
+    job = result['tasks']['202608']['jobs'][name]
+    assert job['status'] == 'submitting' and 'request_id' not in job
+    assert job['reconciliation']['outcome'] == 'lookup_failed' and fake[0].submits == 1
+
+
+@pytest.mark.parametrize('bad_page', [None, {'jobs': None}, {'missing_jobs': []}])
+def test_invalid_list_does_not_prove_absence(setup, fake, monkeypatch, bad_page):
+    name = _uncertain_first(setup, fake, monkeypatch)
+    page = None if bad_page is None else SimpleNamespace(json=bad_page, next=None)
+    monkeypatch.setattr(fake[0], 'get_jobs', lambda **kw: page)
+    result = tick(setup, fake, now=NOW+timedelta(hours=2))
+    assert result['tasks']['202608']['jobs'][name]['reconciliation']['absent_checks'] == 0
+    assert fake[0].submits == 1 and result['failed'] == 1
+
+
+def test_page_limit_never_proves_absence(setup, fake, monkeypatch):
+    name = _uncertain_first(setup, fake, monkeypatch)
+    page = SimpleNamespace(json={'jobs': []}, next=SimpleNamespace(json={'jobs': []}, next=None))
+    monkeypatch.setattr(fake[0], 'get_jobs', lambda **kw: page)
+    result = tick(setup.model_copy(update={'submission_reconcile_max_pages': 1}),
+                  fake, now=NOW+timedelta(hours=2))
+    assert result['tasks']['202608']['jobs'][name]['reconciliation']['absent_checks'] == 0
+    assert fake[0].submits == 1 and result['failed'] == 1
+
+
+def test_lookup_failure_resets_absence_and_checks_are_spaced(setup, fake, monkeypatch):
+    name = _uncertain_first(setup, fake, monkeypatch)
+    tick(setup, fake, now=NOW+timedelta(minutes=10))
+    tick(setup, fake, now=NOW+timedelta(minutes=11))
+    assert fake[0].list_calls == 1
+    list_jobs = fake[0].get_jobs
+    monkeypatch.setattr(fake[0], 'get_jobs', lambda **kw: (_ for _ in ()).throw(OSError()))
+    failed = tick(setup, fake, now=NOW+timedelta(minutes=20))
+    assert failed['tasks']['202608']['jobs'][name]['reconciliation']['absent_checks'] == 0
+    monkeypatch.setattr(fake[0], 'get_jobs', list_jobs)
+    tick(setup, fake, now=NOW+timedelta(minutes=30))
+    assert fake[0].submits == 1  # one successful absent lookup since the failure
+    assert tick(setup, fake, now=NOW+timedelta(minutes=40))['counts'] == {'complete': 1}
+    assert fake[0].submits == 11
+
+
+def test_legacy_unknown_bypasses_old_backoff_and_recovers_receipt(setup, fake, monkeypatch):
+    name = _uncertain_first(setup, fake, monkeypatch, accepted=True)
+    journal = Journal(setup.store_dir)
+    task = journal.data['tasks']['202608']
+    task['next_retry_at'] = (NOW+timedelta(days=1)).isoformat()
+    job = task['jobs'][name]
+    for key in ['submission_started_at', 'request_sha256', 'reconciliation']:
+        job.pop(key, None)
+    journal.save()
+    result = tick(setup, fake, now=NOW+timedelta(minutes=10))
+    assert result['counts'] == {'complete': 1} and fake[0].submits == 10
+
+
+def test_legacy_absent_intent_starts_new_grace_before_retry(setup, fake, monkeypatch):
+    name = _uncertain_first(setup, fake, monkeypatch)
+    journal = Journal(setup.store_dir)
+    job = journal.data['tasks']['202608']['jobs'][name]
+    for key in ['submission_started_at', 'request_sha256', 'reconciliation']:
+        job.pop(key, None)
+    journal.save()
+    for minutes in (120, 130, 140):
+        tick(setup, fake, now=NOW+timedelta(minutes=minutes))
+        assert fake[0].submits == 1
+    assert tick(setup, fake, now=NOW+timedelta(minutes=150))['counts'] == {'complete': 1}
+
+
+def test_old_identical_receipt_and_other_area_are_not_reused(setup, fake, monkeypatch):
+    _uncertain_first(setup, fake, monkeypatch, accepted=True)
+    fake[0].remotes['1'].created_at = NOW-timedelta(days=1)
+    wrong = dict(fake[0].remotes['1'].request, area=[55, 70, 15, 140])
+    fake[0].remotes['other-area'] = Remote('other-area', wrong)
+    for minutes in (10, 20):
+        result = tick(setup, fake, now=NOW+timedelta(minutes=minutes))
+        assert fake[0].submits == 1 and result['publication_revision'] is None
+    result = tick(setup, fake, now=NOW+timedelta(minutes=30))
+    assert result['counts'] == {'complete': 1} and fake[0].submits == 11
+    assert '1' not in fake[0].resumes  # old receipts are excluded before a GET
+    assert all(j['request_id'] not in {'1', 'other-area'}
+               for j in result['tasks']['202608']['jobs'].values())
+
+
+def test_changed_pending_request_pauses_before_query(setup, fake, monkeypatch):
+    name = _uncertain_first(setup, fake, monkeypatch)
+    journal = Journal(setup.store_dir)
+    journal.data['tasks']['202608']['jobs'][name]['request_sha256'] = 'different-request'
+    journal.save()
+    result = tick(setup, fake, now=NOW+timedelta(hours=2))
+    assert result['failed'] == 1 and fake[0].submits == 1 and fake[0].list_calls == 0
+
+
+def test_reconciliation_uses_original_account_only(setup, fake, monkeypatch):
+    _uncertain_first(setup, fake, monkeypatch, accepted=True)
+    other = Account()
+    other.get_jobs = lambda **kw: pytest.fail('must not inspect unrelated account')
+    other.submit = lambda *_: pytest.fail('must not submit on unrelated account')
+    result = pipeline.sync(setup, '202608', now=NOW+timedelta(minutes=10),
+                           accounts_factory=lambda _: {'account': fake[0], 'other': other})
+    assert result['counts'] == {'complete': 1} and fake[0].submits == 10
+
+
+def test_long_tick_records_actual_submit_time(setup, fake, monkeypatch):
+    current = {'now': NOW}
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return current['now']
+    monkeypatch.setattr(pipeline, 'datetime', Clock)
+    submit = fake[0].submit
+    def slow_then_fail(dataset, request):
+        if fake[0].submits == 8:
+            current['now'] = NOW+timedelta(minutes=31)
+        if fake[0].submits == 9:
+            fake[0].submits += 1
+            raise OSError()
+        return submit(dataset, request)
+    monkeypatch.setattr(fake[0], 'submit', slow_then_fail)
+    result = pipeline.sync(setup, '202608', accounts_factory=lambda _: {'account': fake[0]})
+    job = result['tasks']['202608']['jobs']['10m_v_component_of_wind']
+    assert job['submission_started_at'] == (NOW+timedelta(minutes=31)).isoformat()
+    assert result['tasks']['202608']['next_retry_at'] == (NOW+timedelta(minutes=41)).isoformat()
+    for minutes in (41, 51):
+        tick(setup, fake, now=NOW+timedelta(minutes=minutes))
+        assert fake[0].submits == 10
+
+
+def test_crash_after_recovered_id_save_resumes_without_duplicate(setup, fake, monkeypatch):
+    name = _uncertain_first(setup, fake, monkeypatch, accepted=True)
+    save = Journal.save
+    def power_off(journal):
+        save(journal)
+        job = journal.data['tasks']['202608']['jobs'][name]
+        if job.get('reconciliation', {}).get('outcome') == 'attached':
+            raise SystemExit('power off after receipt save')
+    monkeypatch.setattr(Journal, 'save', power_off)
+    with pytest.raises(SystemExit):
+        tick(setup, fake, now=NOW+timedelta(minutes=10))
+    saved = Journal.read(setup.store_dir)['tasks']['202608']['jobs'][name]
+    assert saved['request_id'] == '1' and saved['status'] == 'submitted'
+    assert fake[0].submits == 1
+    monkeypatch.setattr(Journal, 'save', save)
+    result = tick(setup, fake, now=NOW+timedelta(minutes=11))
+    assert result['counts'] == {'complete': 1} and fake[0].submits == 10
+
+
+def test_crash_after_absence_save_rechecks_before_delayed_post(setup, fake, monkeypatch):
+    name = _uncertain_first(setup, fake, monkeypatch)
+    for minutes in (10, 20):
+        tick(setup, fake, now=NOW+timedelta(minutes=minutes))
+    save = Journal.save
+    def power_off(journal):
+        save(journal)
+        job = journal.data['tasks']['202608']['jobs'][name]
+        if job.get('reconciliation', {}).get('outcome') == 'confirmed_absent':
+            raise SystemExit('power off before retry admission')
+    monkeypatch.setattr(Journal, 'save', power_off)
+    with pytest.raises(SystemExit):
+        tick(setup, fake, now=NOW+timedelta(minutes=30))
+    assert fake[0].submits == 1
+    monkeypatch.setattr(Journal, 'save', save)
+    from climate_reanalysis.download import build_request
+    # The original request appears while the producer is down.
+    fake[0].remotes['late'] = Remote('late', build_request(name, '202608', setup.area))
+    result = tick(setup, fake, now=NOW+timedelta(minutes=40))
+    assert result['counts'] == {'complete': 1} and fake[0].submits == 10
+    assert result['tasks']['202608']['jobs'][name]['request_id'] == 'late'
+
+
+def test_confirmed_absence_respects_budget_and_rechecks_when_slot_frees(setup, fake, monkeypatch):
+    from collections import Counter
+    from climate_reanalysis.download import build_request
+    name = _uncertain_first(setup, fake, monkeypatch)
+    for minutes in (10, 20):
+        tick(setup, fake, now=NOW+timedelta(minutes=minutes))
+    s = setup.model_copy(update={'concurrency': 1})
+    journal = Journal(s.store_dir)
+    task = journal.data['tasks']['202608']
+    full = Counter(account=2)  # the uncertain intent plus another active job
+    assert not jobs.advance_downloads(pipeline.task_settings(s, task), task, journal,
+                                     lambda: {'account': fake[0]}, full,
+                                     now=NOW+timedelta(minutes=30))
+    assert full['account'] == 1 and fake[0].submits == 1
+    assert task['jobs'][name]['status'] == 'failed'
+    fake[0].remotes['late'] = Remote('late', build_request(name, '202608', s.area))
+    assert tick(s, fake, now=NOW+timedelta(minutes=40))['counts'] == {'complete': 1}
+    assert fake[0].submits == 10
+
+
+def test_malformed_receipt_pauses_and_never_proves_absence(setup, fake, monkeypatch):
+    name = _uncertain_first(setup, fake, monkeypatch, accepted=True)
+    monkeypatch.setattr(fake[0], 'get_remote', lambda _: SimpleNamespace(
+        json={'processID': fake[0].remotes['1'].collection_id, 'metadata': {}}))
+    result = tick(setup, fake, now=NOW+timedelta(hours=2))
+    job = result['tasks']['202608']['jobs'][name]
+    assert job['status'] == 'submitting' and job['reconciliation']['absent_checks'] == 0
+    assert job['reconciliation']['outcome'] == 'lookup_failed'
+    assert fake[0].submits == 1 and result['failed'] == 1
+
+
+def test_recovered_terminal_job_retries_without_deleting_receipt(setup, fake, monkeypatch):
+    name = _uncertain_first(setup, fake, monkeypatch, accepted=True)
+    fake[0].remotes['1'].status = 'rejected'
+    monkeypatch.setattr(fake[0], 'delete', lambda _: pytest.fail('must not delete recovered job'),
+                        raising=False)
+    result = tick(setup, fake, now=NOW+timedelta(minutes=10))
+    job = result['tasks']['202608']['jobs'][name]
+    assert job['status'] == 'rejected' and job['request_id'] == '1'
+    assert fake[0].submits == 1 and result['failed'] == 1
+    result = tick(setup, fake, now=NOW+timedelta(minutes=70))
+    assert result['counts'] == {'complete': 1} and fake[0].submits == 11
+    retried = result['tasks']['202608']['jobs'][name]
+    assert retried['previous_ids'] == ['1']
+    assert retried['submission_recoveries'][-1]['outcome'] == 'attached'
+
+
+def test_invalid_submit_receipt_is_reconciled_without_duplicate(setup, fake, monkeypatch):
+    submit = fake[0].submit
+    def invalid_receipt(dataset, request):
+        remote = submit(dataset, request)
+        return SimpleNamespace(request_id=None) if fake[0].submits == 1 else remote
+    monkeypatch.setattr(fake[0], 'submit', invalid_receipt)
+    first = tick(setup, fake)
+    job = next(iter(first['tasks']['202608']['jobs'].values()))
+    assert job['status'] == 'submitting' and 'request_id' not in job
+    result = tick(setup, fake, now=NOW+timedelta(minutes=10))
+    assert result['counts'] == {'complete': 1} and fake[0].submits == 10

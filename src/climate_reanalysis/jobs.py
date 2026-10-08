@@ -2,12 +2,16 @@
 from __future__ import annotations
 
 from collections import Counter
+from datetime import datetime, timezone, timedelta
 import hashlib
 
 from climate_reanalysis import cds
 from climate_reanalysis.download import DATASET, build_request, raw_path
 from climate_reanalysis.manifest import _sha256_of, write_manifest
 from climate_reanalysis.variables import cds_variables
+from climate_reanalysis import submission
+
+SubmissionRecoveryError = submission.SubmissionRecoveryError
 
 TERMINAL = {'failed', 'rejected', 'dismissed', 'deleted'}
 
@@ -26,12 +30,14 @@ def make_accounts(settings):
     return accounts
 
 
-def advance_downloads(settings, task, journal, accounts_factory, active):
+def advance_downloads(settings, task, journal, accounts_factory, active, now=None, clock=None):
     """Returns True only when all task manifests exist and match downloaded bytes.
 
     A non-terminal remote job consumes an account slot across ticks/months.
     Transfer failure retains the same job id, never requeues its CDS request.
     """
+    now = now or datetime.now(timezone.utc)
+    clock = clock or (lambda: now)
     complete = True
     for var in task['variables']:
         files = []
@@ -45,11 +51,24 @@ def advance_downloads(settings, task, journal, accounts_factory, active):
                     raise ValueError(f'{task["month"]}/{name}: downloaded file changed')
                 files.append(target)
                 continue
+            if (job and job.get('status') == 'failed'
+                    and job.get('reconciliation', {}).get('outcome') == 'confirmed_absent'
+                    and clock() >= submission.utc(job['reconciliation']['last_checked_at'])
+                        + timedelta(minutes=settings.submission_reconcile_interval_minutes)):
+                # Admission may have been delayed by a crash or account budget.
+                # Recheck old absence evidence before issuing the eventual POST.
+                job['status'] = 'submitting'
+                active[job['account']] += 1
+                journal.save()
             if job and job.get('status') == 'submitting':
-                raise ValueError(f'{name}: submission outcome unknown; use attach-job')
+                if not submission.reconcile(settings, task, name, journal, accounts_factory, clock()):
+                    return False
+                if job['status'] == 'failed':
+                    active[job['account']] -= 1
             accounts = accounts_factory()
             if job is None or job.get('status') in TERMINAL:
-                if job and job.get('request_id'):
+                if (job and job.get('request_id')
+                        and job.get('reconciliation', {}).get('outcome') != 'attached'):
                     # Only our own already-terminal job, never account-wide cleanup.
                     if job['account'] not in accounts:
                         raise ValueError('original CDS account is not configured')
@@ -68,14 +87,38 @@ def advance_downloads(settings, task, journal, accounts_factory, active):
                 history = list((job or {}).get('previous_ids', []))
                 if job and job.get('request_id'):
                     history.append(job['request_id'])
+                recoveries = list((job or {}).get('submission_recoveries', []))
+                if job and job.get('reconciliation'):
+                    recoveries.append({'account': job['account'],
+                                       **job['reconciliation'],
+                                       'submission_error_type': job.get('submission_error_type')})
+                request = build_request(name, task['month'], settings.area)
                 job = {'account': account, 'status': 'submitting', 'attempts': attempts,
-                       'previous_ids': history}
+                       'previous_ids': history, 'submission_started_at': submission.iso(clock()),
+                       'request_sha256': submission.fingerprint(request),
+                       'submission_recoveries': recoveries}
                 task['jobs'][name] = job
                 journal.save()  # intent BEFORE the network call
                 active[account] += 1  # uncertain submits also consume queue capacity
-                remote = accounts[account].submit(
-                    DATASET, build_request(name, task['month'], settings.area))
-                job.update(request_id=remote.request_id, status='submitted')
+                try:
+                    remote = accounts[account].submit(DATASET, request)
+                    request_id = remote.request_id
+                    if not isinstance(request_id, str) or not request_id:
+                        raise ValueError('invalid CDS submission receipt')
+                except Exception as exc:
+                    failed_at = clock()
+                    job['submission_error_type'] = type(exc).__name__
+                    job['reconciliation'] = {
+                        'started_at': submission.iso(failed_at), 'absent_checks': 0,
+                        'outcome': 'waiting',
+                        'next_check_at': submission.iso(failed_at + timedelta(
+                            minutes=settings.submission_reconcile_interval_minutes)),
+                    }
+                    journal.save()
+                    raise SubmissionRecoveryError(
+                        f'{name}: submission outcome unknown ({type(exc).__name__}); '
+                        'automatic reconciliation will retry; attach-job remains available') from None
+                job.update(request_id=request_id, status='submitted')
                 journal.save()  # receipt immediately; no poll before this save
             else:
                 account = job['account']

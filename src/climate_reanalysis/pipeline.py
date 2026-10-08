@@ -85,7 +85,7 @@ def _prepare_candidate(settings, task, work, journal):
     journal.save()
 
 
-def _advance(settings, task, journal, accounts, active, now):
+def _advance(settings, task, journal, accounts, active, now, clock=None):
     work = task_settings(settings, task)
     entry = publication.read_index(settings.store_dir)['months'].get(task['month'])
     if entry and entry['task_id'] == task['id']:
@@ -95,7 +95,7 @@ def _advance(settings, task, journal, accounts, active, now):
         journal.save()
         return
     if task['stage'] == 'pending_download':
-        if not jobs.advance_downloads(work, task, journal, accounts, active):
+        if not jobs.advance_downloads(work, task, journal, accounts, active, now, clock):
             return
         task['stage'] = 'pending_restore'
         journal.save()
@@ -131,7 +131,10 @@ def _advance(settings, task, journal, accounts, active, now):
 
 def sync(settings, start: str, *, refresh: bool = False, now=None, accounts_factory=None):
     """One tick; returns machine-readable status. Pending CDS jobs are normal success."""
-    now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    # In production a tick can transfer several files before the next submit.
+    # Timestamp that actual submit, rather than the possibly much earlier tick.
+    clock = (lambda: now) if now is not None else (lambda: datetime.now(timezone.utc))
+    now = (now or clock()).astimezone(timezone.utc)
     # Validate start before creating files; use a canonical UTC date in all decisions.
     datetime.strptime(start, '%Y%m')
     if len(start) != 6:
@@ -159,14 +162,20 @@ def sync(settings, start: str, *, refresh: bool = False, now=None, accounts_fact
         for task in journal.data['tasks'].values():
             if task['stage'] in FINISHED:
                 continue
-            if task.get('next_retry_at') and _iso(now) < task['next_retry_at']:
+            uncertain = any(j.get('status') == 'submitting' for j in task['jobs'].values())
+            if task.get('next_retry_at') and _iso(now) < task['next_retry_at'] and not uncertain:
                 continue
             task['updated_at'] = _iso(now)
             try:
-                _advance(settings, task, journal, accounts, active, now)
+                _advance(settings, task, journal, accounts, active, now, clock)
                 # A successful intermediate poll clears the previous transient error.
                 if task['stage'] not in FINISHED:
                     task.update(last_error=None, next_retry_at=None)
+            except jobs.SubmissionRecoveryError as exc:
+                # Reconciliation has its own persisted cadence; old 24h backoffs
+                # must not keep legacy uncertain intents stuck until tomorrow.
+                task.update(last_error=str(exc), next_retry_at=_iso(clock() + timedelta(
+                    minutes=settings.submission_reconcile_interval_minutes)))
             except Exception as exc:
                 task['attempts'] += 1
                 # Remote exceptions can contain signed URLs or credentials. Persist
@@ -213,6 +222,9 @@ def attach_job(settings, month, variable, request_id):
         if collection != DATASET or request != expected:
             raise ValueError('CDS receipt does not match the pending request')
         job.update(request_id=request_id, status='submitted')
+        if job.get('reconciliation'):
+            job['reconciliation'].update(outcome='operator_attached', request_id=request_id)
+            job['reconciliation'].pop('last_error', None)
         task.update(last_error=None, next_retry_at=None)
         journal.save()
 
@@ -227,6 +239,9 @@ def retry_submission(settings, month, variable):
             raise ValueError('only uncertain submissions can be reset')
         job['status'] = 'failed'
         job['operator_confirmed_absent'] = True
+        if job.get('reconciliation'):
+            job['reconciliation']['outcome'] = 'operator_confirmed_absent'
+            job['reconciliation'].pop('last_error', None)
         task.update(last_error=None, next_retry_at=None)
         journal.save()
 

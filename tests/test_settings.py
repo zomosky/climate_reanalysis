@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from climate_reanalysis.settings import Settings, load_settings
 
@@ -17,6 +18,27 @@ def test_defaults_match_spec():
     assert s.concurrency == 4
     assert s.dl_proxy is None               # 不得硬编码代理
     assert s.cold_dir is None               # 未配置 = 归档拒绝执行，不给默认路径
+    assert s.submission_reconcile_interval_minutes == 10
+    assert s.submission_reconcile_grace_minutes == 30
+    assert s.submission_reconcile_absence_checks == 2
+    assert s.submission_reconcile_max_pages == 20
+
+
+@pytest.mark.parametrize('field,value', [
+    ('submission_reconcile_interval_minutes', 0),
+    ('submission_reconcile_grace_minutes', 0),
+    ('submission_reconcile_absence_checks', 1),
+    ('submission_reconcile_max_pages', 0),
+])
+def test_reconciliation_limits_cannot_disable_safety(field, value):
+    with pytest.raises(ValidationError):
+        Settings(**{field: value})
+
+
+def test_example_settings_contains_reconciliation_policy():
+    s = load_settings(Path(__file__).resolve().parents[1] / 'config' / 'settings.yaml.example')
+    assert s.submission_reconcile_grace_minutes == 30
+    assert s.submission_reconcile_absence_checks == 2
 
 
 def test_relative_paths_anchor_to_project_root(tmp_path: Path):

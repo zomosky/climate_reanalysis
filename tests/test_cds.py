@@ -66,6 +66,7 @@ def test_curl_download_passes_proxy_and_resume_flags(monkeypatch, tmp_path: Path
 
     def fake_run(cmd, **kw):
         seen["cmd"] = cmd
+        seen['input'] = kw['input']
         Path(cmd[cmd.index("-o") + 1]).write_bytes(b"data")
         return SimpleNamespace(returncode=0)
 
@@ -73,8 +74,8 @@ def test_curl_download_passes_proxy_and_resume_flags(monkeypatch, tmp_path: Path
     target = tmp_path / "out.bin"
     curl_download("https://obj/x.zip", target, proxy="http://127.0.0.1:7890")
     assert "-C" in seen["cmd"] and "-" in seen["cmd"]      # 断点续传
-    assert "-x" in seen["cmd"]
-    assert "http://127.0.0.1:7890" in seen["cmd"]
+    assert 'http://127.0.0.1:7890' in seen['input']
+    assert 'http://127.0.0.1:7890' not in seen['cmd']
     assert target.read_bytes() == b"data"
 
 
@@ -90,6 +91,7 @@ def test_curl_download_omits_proxy_when_none(monkeypatch, tmp_path: Path):
     monkeypatch.setattr(subprocess, "run", fake_run)
     curl_download("https://obj/x.zip", tmp_path / "o.bin", proxy=None)
     assert "-x" not in seen["cmd"]
+    assert '--noproxy' in seen['cmd']
 
 
 def test_curl_download_raises_after_attempts(monkeypatch, tmp_path: Path):
@@ -557,5 +559,5 @@ def test_legacy_size_acceptance_is_unchanged(monkeypatch,tmp_path):
         return SimpleNamespace(returncode=0)
     monkeypatch.setattr(subprocess,'run',transfer)
     curl_download('https://obj/x',tmp_path/'legacy',None,attempts=1)
-    with pytest.raises(RuntimeError):
+    with pytest.raises(ValueError, match='exceeds'):
         curl_download('https://obj/x',tmp_path/'managed',None,attempts=1,strict_size=True)

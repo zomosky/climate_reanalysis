@@ -34,6 +34,8 @@ concurrency: 4
 # sync 持久化调度：最多同时推进的月份、失败退避起点、仍为 ERA5T 时再尝试的间隔。
 max_active_months: 2
 retry_hours: 1
+# 传输有进展时 10 分钟后续传；无进展按 10/20/40/60 分钟退避。
+transfer_retry_minutes: 10
 final_retry_days: 7
 
 # 提交结果不明时自动核对原账号：每 10 分钟完整查询一次；至少等 30 分钟，

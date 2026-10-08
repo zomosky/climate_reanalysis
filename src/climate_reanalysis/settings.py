@@ -32,6 +32,8 @@ class Settings(BaseModel):
     #: sync 同时推进的月份数；每个账号仍受 concurrency 限制。
     max_active_months: int = Field(default=2, ge=1)
     retry_hours: int = Field(default=1, ge=1)
+    #: File transfers retry independently of submission/processing failures.
+    transfer_retry_minutes: int = Field(default=10, ge=1, le=60)
     final_retry_days: int = Field(default=7, ge=1)
     #: Unknown submits: bounded, complete CDS lookups before reusing/retrying.
     submission_reconcile_interval_minutes: int = Field(default=10, ge=1)

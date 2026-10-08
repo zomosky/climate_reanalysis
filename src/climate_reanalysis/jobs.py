@@ -150,8 +150,11 @@ def advance_downloads(settings, task, journal, accounts_factory, active, now=Non
             if status != 'successful':
                 variable_complete = False
                 continue
-            cds.curl_download(cds.results_url(remote.get_results()), target,
-                              settings.dl_proxy, strict_size=True)
+            results = remote.get_results()
+            cds.curl_download(cds.results_url(results), target,
+                              settings.dl_proxy, strict_size=True,
+                              expected_bytes=cds.results_size(results),
+                              refresh_results=remote.get_results)
             job.update(status='downloaded', size_bytes=target.stat().st_size,
                        sha256=_sha256_of(target))
             active[account] -= 1

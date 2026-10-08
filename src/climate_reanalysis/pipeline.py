@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 import shutil
 import uuid
 
-from climate_reanalysis import jobs, publication, store
+from climate_reanalysis import cds, jobs, publication, store
 from climate_reanalysis.manifest import manifest_path, manifest_sha256
 from climate_reanalysis.period import ready_months
 from climate_reanalysis.refresh import _month_end
@@ -171,11 +171,19 @@ def sync(settings, start: str, *, refresh: bool = False, now=None, accounts_fact
                 # A successful intermediate poll clears the previous transient error.
                 if task['stage'] not in FINISHED:
                     task.update(last_error=None, next_retry_at=None)
+                task['transfer_attempts'] = 0
             except jobs.SubmissionRecoveryError as exc:
                 # Reconciliation has its own persisted cadence; old 24h backoffs
                 # must not keep legacy uncertain intents stuck until tomorrow.
                 task.update(last_error=str(exc), next_retry_at=_iso(clock() + timedelta(
                     minutes=settings.submission_reconcile_interval_minutes)))
+            except cds.TransferError as exc:
+                # Progress resets transfer backoff. Historic submission failures
+                # must not keep a nearly complete file idle for another 24 hours.
+                failures = 0 if exc.grew else task.get('transfer_attempts', 0) + 1
+                minutes = min(60, settings.transfer_retry_minutes * 2 ** min(max(0, failures-1), 6))
+                task.update(transfer_attempts=failures, last_error=str(exc),
+                            next_retry_at=_iso(clock() + timedelta(minutes=minutes)))
             except Exception as exc:
                 task['attempts'] += 1
                 # Remote exceptions can contain signed URLs or credentials. Persist

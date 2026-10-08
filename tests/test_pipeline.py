@@ -140,6 +140,46 @@ def test_transfer_failure_retains_id_and_retry_time(setup, fake):
     assert fake[0].submits == 10  # no second submit for interrupted transfer
 
 
+def test_transfer_backoff_is_independent_and_resets_on_progress(setup, fake, monkeypatch):
+    # Seed the same state as an old submission failure followed by a transfer.
+    fake[1]['fail'] = True
+    first = tick(setup, fake)
+    job = next(iter(first['tasks']['202608']['jobs'].values()))
+    original_id = job['request_id']
+    journal = Journal(setup.store_dir)
+    journal.data['tasks']['202608'].update(attempts=9, next_retry_at=None)
+    journal.save()
+    original_transfer = jobs.cds.curl_download
+    progressing = False
+
+    def interrupted(*_args, **_kw):
+        raise jobs.cds.TransferError(18, 40, 100, grew=progressing)
+
+    monkeypatch.setattr(jobs.cds, 'curl_download', interrupted)
+    current = NOW
+    for wait in (10, 20, 40, 60):
+        result = tick(setup, fake, now=current)
+        task = result['tasks']['202608']
+        assert task['attempts'] == 9
+        assert task['next_retry_at'] == (current + timedelta(minutes=wait)).isoformat()
+        assert 'rc=18' in task['last_error'] and '40/100' in task['last_error']
+        assert next(iter(task['jobs'].values()))['request_id'] == original_id
+        assert fake[0].submits == 1
+        tick(setup, fake, now=current + timedelta(minutes=wait-1))
+        assert fake[0].submits == 1
+        current += timedelta(minutes=wait)
+    progressing = True
+    task = tick(setup, fake, now=current)['tasks']['202608']
+    assert task['next_retry_at'] == (current + timedelta(minutes=10)).isoformat()
+    assert task['transfer_attempts'] == 0
+    fake[1]['fail'] = False
+    monkeypatch.setattr(jobs.cds, 'curl_download', original_transfer)
+    result = tick(setup, fake, now=current + timedelta(minutes=10))
+    assert result['counts'] == {'complete': 1}
+    assert result['tasks']['202608']['transfer_attempts'] == 0
+    assert fake[0].submits == 10
+
+
 def test_uncertain_submit_not_resubmitted_after_one_absence_check(setup, fake, monkeypatch):
     def lost_reply(*args):
         fake[0].submits += 1

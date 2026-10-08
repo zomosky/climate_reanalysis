@@ -14,11 +14,42 @@ from __future__ import annotations
 import os
 import subprocess
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 from climate_reanalysis.logging_setup import get_logger
 
 log = get_logger(__name__)
+
+
+class TransferError(RuntimeError):
+    """Safe transfer diagnostics; the saved CDS job and partial file remain usable."""
+
+    def __init__(self, rc: int | None, have: int, expected: int | None, *, grew=False):
+        self.rc, self.have, self.expected, self.grew = rc, have, expected, grew
+        super().__init__(f'curl transfer incomplete: rc={rc}, bytes={have}/{expected}; '
+                         'partial retained for resume')
+
+
+def results_size(results) -> int | None:
+    """Prefer CDS asset metadata to another unreliable object-store HEAD."""
+    value = getattr(results, 'content_length', None)
+    if value is None:
+        value = (getattr(results, 'asset', None) or {}).get('file:size')
+    if value is None:
+        return None
+    try:
+        size = int(value)
+    except (TypeError, ValueError):
+        raise ValueError('invalid CDS result size') from None
+    if size <= 0:
+        raise ValueError('invalid CDS result size')
+    return size
+
+
+def _curl_config_value(value: str) -> str:
+    return '"' + value.replace('\\', '\\\\').replace('"', '\\"').replace(
+        '\n', '\\n').replace('\r', '\\r') + '"'
 
 
 def read_cdsapirc(path: Path | None = None) -> tuple[str, str]:
@@ -121,12 +152,14 @@ def _expected_size(url: str, proxy: str | None) -> int | None:
         cl = resp.headers.get("Content-Length")
         return int(cl) if cl is not None else None
     except Exception as exc:  # noqa: BLE001 - 探测失败不阻断下载，只是校验退化——但必须出声
-        log.warning("expected_size_probe_failed", url=url, error=str(exc))
+        log.warning("expected_size_probe_failed", error_type=type(exc).__name__)
         return None
 
 
 def curl_download(url: str, target: Path, proxy: str | None,
-                  attempts: int = 8, *, strict_size: bool = False) -> None:
+                  attempts: int = 8, *, strict_size: bool = False,
+                  expected_bytes: int | None = None,
+                  refresh_results: Callable[[], object] | None = None) -> None:
     """可续传下载。``-C -`` 使断掉的传输接着传而不是重来。
 
     curl 返回码 0 不代表文件完整（见 ``_expected_size`` 的注释）——下载完
@@ -144,29 +177,63 @@ def curl_download(url: str, target: Path, proxy: str | None,
     target = Path(target)
     target.parent.mkdir(parents=True, exist_ok=True)
     part = target.parent / f"{target.name}.part"
-    expected = _expected_size(url, proxy)   # 只探测一次，url 在各次尝试间不变
+    expected = expected_bytes if expected_bytes is not None else _expected_size(url, proxy)
     if strict_size and (expected is None or expected <= 0):
         raise ValueError("remote size unavailable; refusing unchecked managed download")
+    initial = part.stat().st_size if part.exists() else 0
+    rc = None
     for i in range(1, attempts + 1):
-        cmd = ["curl", "-sSL", "-C", "-", "--retry", "3", "--retry-delay", "5",
-               "--retry-all-errors", "--connect-timeout", "30", "--fail"]
+        before = part.stat().st_size if part.exists() else 0
+        if strict_size and before > expected:
+            raise ValueError('partial file exceeds remote size; preserved for inspection')
+        # A previous process may have received every byte but died before rename.
+        if strict_size and before == expected:
+            os.replace(part, target)
+            return
+        if i > 1 and refresh_results is not None:
+            try:
+                results = refresh_results()
+                refreshed_size = results_size(results)
+                url = results_url(results)
+            except Exception:
+                raise TransferError(None, before, expected, grew=before > initial) from None
+            if refreshed_size is not None:
+                if expected is not None and refreshed_size != expected:
+                    raise ValueError('remote size changed; partial preserved for inspection')
+                expected = refreshed_size
+        # curl's internal retries can discard new bytes and reuse the old offset.
+        # Each invocation instead computes -C - afresh, with a bounded duration.
+        # Ignore curlrc and implicit environment proxies. Signed URLs and proxy
+        # credentials go through stdin, never process arguments or exception text.
+        cmd = ["curl", "-q", "-sSL", "-C", "-", "--connect-timeout", "30",
+               "--max-time", "300", "--fail", "--config", "-", "-o", str(part)]
+        config = 'url = ' + _curl_config_value(url) + '\n'
         if proxy:
-            cmd += ["-x", proxy]
-        cmd += ["-o", str(part), url]
-        r = subprocess.run(cmd)
+            config += 'proxy = ' + _curl_config_value(proxy) + '\n'
+            cmd += ['--noproxy', '']
+        else:
+            cmd += ['--noproxy', '*']
+        r = subprocess.run(cmd, input=config, text=True, capture_output=True)
+        rc = r.returncode
         have = part.stat().st_size if part.exists() else 0
+        if have < before:
+            raise ValueError('partial file shrank during transfer; refusing publication')
+        if strict_size and have > expected:
+            raise ValueError('partial file exceeds remote size; preserved for inspection')
         size_ok = expected is None or (have == expected if strict_size else have >= expected)
-        if r.returncode == 0 and size_ok:
+        if rc == 0 and size_ok:
             os.replace(part, target)   # target 出现即代表完整，不会有中间态
             return
-        if r.returncode == 0:
+        if rc == 0:
             log.warning("curl_size_mismatch", have=have, expected=expected,
                        attempt=i, target=str(target))
         else:
-            log.warning("curl_failed", rc=r.returncode, attempt=i, target=str(target))
+            log.warning("curl_failed", rc=rc, attempt=i, before=before, have=have,
+                        expected=expected, target=str(target))
         if i < attempts:  # 最后一次失败后没有下一次尝试，不必再空等再报错
             time.sleep(min(10 * i, 60))
-    raise RuntimeError(f"curl 下载失败（{attempts} 次）: {url}")
+    have = part.stat().st_size if part.exists() else 0
+    raise TransferError(rc, have, expected, grew=have > initial)
 
 
 def retrieve(client, dataset: str, request: dict, target: Path,

@@ -10,10 +10,11 @@ from climate_reanalysis.download import DATASET, build_request, raw_path
 from climate_reanalysis.manifest import _sha256_of, write_manifest
 from climate_reanalysis.variables import cds_variables
 from climate_reanalysis import submission
+from climate_reanalysis.raw_validation import IncompleteMonthError, time_axis_report
 
 SubmissionRecoveryError = submission.SubmissionRecoveryError
 
-TERMINAL = {'failed', 'rejected', 'dismissed', 'deleted'}
+TERMINAL = {'failed', 'rejected', 'dismissed', 'deleted', 'incomplete'}
 
 
 def make_accounts(settings):
@@ -39,6 +40,7 @@ def advance_downloads(settings, task, journal, accounts_factory, active, now=Non
     now = now or datetime.now(timezone.utc)
     clock = clock or (lambda: now)
     complete = True
+    incomplete = {}
     for var in task['variables']:
         files = []
         variable_complete = True
@@ -68,6 +70,7 @@ def advance_downloads(settings, task, journal, accounts_factory, active, now=Non
             accounts = accounts_factory()
             if job is None or job.get('status') in TERMINAL:
                 if (job and job.get('request_id')
+                        and job.get('status') != 'incomplete'
                         and job.get('reconciliation', {}).get('outcome') != 'attached'):
                     # Only our own already-terminal job, never account-wide cleanup.
                     if job['account'] not in accounts:
@@ -161,13 +164,32 @@ def advance_downloads(settings, task, journal, accounts_factory, active, now=Non
             journal.save()
             files.append(target)
         if variable_complete:
+            reports = {p.stem: report for p in files
+                       if (report := time_axis_report(p, task['month'])) is not None}
+            if reports:
+                incomplete.update(reports)
+                continue
             # Do not rewrite completed_at/sha on every tick.
             from climate_reanalysis.manifest import manifest_path
             if not manifest_path(settings.manifest_dir, task['month'], var).exists():
                 write_manifest(settings.manifest_dir, task['month'], var, files, settings.area)
         else:
             complete = False
+    # Finish polling outstanding requests before releasing this month. Never
+    # abandon an accepted job or delay its receipt solely for another partial file.
+    if complete and incomplete:
+        raise IncompleteMonthError(task['month'], incomplete)
     return complete
+
+
+def check_task_time_axes(settings, task):
+    """Also audit old pending_restore tasks produced before raw validation."""
+    names = {name for var in task['variables'] for name in cds_variables(var)}
+    reports = {name: report for name in sorted(names)
+               if (report := time_axis_report(
+                   raw_path(settings.raw_dir, task['month'], name), task['month'])) is not None}
+    if reports:
+        raise IncompleteMonthError(task['month'], reports)
 
 
 def active_jobs(tasks):

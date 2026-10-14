@@ -34,13 +34,15 @@ class Settings(BaseModel):
     retry_hours: int = Field(default=1, ge=1)
     #: File transfers retry independently of submission/processing failures.
     transfer_retry_minutes: int = Field(default=10, ge=1, le=60)
+    #: Readable but incomplete CDS responses require a fresh result, not restore.
+    incomplete_retry_hours: int = Field(default=6, ge=1)
     final_retry_days: int = Field(default=7, ge=1)
     #: Unknown submits: bounded, complete CDS lookups before reusing/retrying.
     submission_reconcile_interval_minutes: int = Field(default=10, ge=1)
     submission_reconcile_grace_minutes: int = Field(default=30, ge=1)
     submission_reconcile_absence_checks: int = Field(default=2, ge=2)
     submission_reconcile_max_pages: int = Field(default=20, ge=1)
-    #: ERA5 发布延迟：月末再等这么多天才认为该月齐全（实测 T-5 可得、T-3 不可得）
+    #: 下月首日再等这些天才尝试整月；文件时间轴校验才证明该月齐全。
     publish_lag_days: int = 5
     #: ERA5T 初步数据换新窗口：月末再等这么多天才认为该月的初步值（expver=0005）
     #: 已经"过期"、该重新拉一遍 final（final 实测滞后 2-3 个月）

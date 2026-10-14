@@ -16,6 +16,8 @@ ERA5 再分析的**持续积累**管线，与 `climate_pipeline` 里的 `downloa
 新增 `sync --start YYYYMM [--refresh]`：保存 CDS 任务 ID 和阶段，支持失败退避、
 候选全月校验和不可变版本发布。`status` 输出可供调度/监控读取的 JSON。
 ERA5T 换新保留旧 raw 和月库，下载验证完成后才原子切换发布索引。
+CDS 成功返回但时间轴缺失的文件，在生成 manifest 前拦截并记录缺失范围；
+默认 6 小时后仅重取不完整文件，复用完整文件并保留旧尝试。
 提交异常后自动核对原 CDS 账号：唯一匹配则续接；经过等待及多次完整核对确认
 没有匹配请求后才重提。查询失败、分页未完成或匹配不唯一时保留暂停原因。
 
@@ -61,7 +63,8 @@ cp config/settings.yaml.example config/settings.yaml
 | `store_dir` | 月度国网库根目录，按年分层落盘（`climate_zrread` 的 `era5` 源指向它，见下方「月库目录结构」） |
 | `dl_proxy` | **只用于 bulk download**，submit/poll 一律直连；留空 = 裸连 |
 | `concurrency` | 每期并发下载的（月×变量）任务数，出厂 4 |
-| `publish_lag_days` | ERA5 发布延迟（天），出厂 5——月末再等这么多天才认为该月齐全 |
+| `publish_lag_days` | 整月请求日期门槛（天），出厂 5——下月首日再等这些天；实际完整性由文件时间轴确认 |
+| `incomplete_retry_hours` | CDS 结果缺时次时的新结果重取间隔，出厂 6 小时；保留旧结果和已完整文件 |
 | `refresh_after_days` | ERA5T 初步数据换新窗口（天），出厂 100——月末再等这么多天才认为初步值「过期」，见下方「ERA5T 刷新」 |
 | `cold_dir` | 冷盘归档根目录；留空（出厂 `None`）= 未配置，`archive` 拒绝执行，见下方「冷存归档」 |
 | `area` | 请求区域 `(N, W, S, E)`，需与产出网格 15–55N / 70–140E 一致 |

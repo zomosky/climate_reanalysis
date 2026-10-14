@@ -1,7 +1,8 @@
 """月份枚举与「整月齐了才发布」的就绪判据。
 
-ERA5 有约 5 天发布延迟（实测 T-5 可得、T-3 不可得），故一个月要到**月末再过
-``lag_days`` 天**才认为齐全。半个月不发布——下游因此永远看到"要么没有、要么完整"，
+ERA5 有约 5 天发布延迟，最后一日的小时数据不能在 D+5 凌晨假定已经齐全。
+等到下月首日 + ``lag_days``，再由原始文件的时间轴确认完整。半个月不发布——
+下游因此永远看到"要么没有、要么完整"，
 无需处理尾部 NaN 的模糊语义（spec D4）。
 
 ``today`` 由调用方传入而非内部取时钟，使就绪判据在测试里可精确断言。
@@ -31,12 +32,11 @@ def month_hours(month: str) -> np.ndarray:
 
 
 def is_ready(month: str, today: dt.date, lag_days: int) -> bool:
-    """该月是否已齐全（月末 + lag_days 已过）。"""
+    """该月是否可以尝试整月请求（最后一日的滞后窗口已完整经过）。"""
     y, m = int(month[:4]), int(month[4:6])
     ny, nm = _next_month(y, m)
     first_of_next = dt.date(ny, nm, 1)
-    last_of_month = first_of_next - dt.timedelta(days=1)
-    return today >= last_of_month + dt.timedelta(days=lag_days)
+    return today >= first_of_next + dt.timedelta(days=lag_days)
 
 
 def ready_months(start: str, today: dt.date, lag_days: int) -> list[str]:

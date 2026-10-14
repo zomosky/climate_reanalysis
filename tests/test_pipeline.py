@@ -234,6 +234,162 @@ def test_restore_failure_retries_without_redownload(setup, fake, monkeypatch):
     assert fake[0].submits == 10
 
 
+def partial_results(fake, monkeypatch, names):
+    """A successful CDS response can be a readable but incomplete month."""
+    import xarray as xr
+    original = jobs.cds.curl_download
+    control = {'names': set(names)}
+
+    def transfer(url, target, proxy, **kw):
+        original(url, target, proxy, **kw)
+        name = fake[0].remotes[url].request['variable'][0]
+        if name in control['names']:
+            with xr.open_dataset(target) as ds:
+                part = ds.isel(valid_time=slice(None, -23)).load()
+            part.to_netcdf(target)
+
+    monkeypatch.setattr(jobs.cds, 'curl_download', transfer)
+    return control
+
+
+def test_incomplete_cds_result_retries_only_bad_files_and_preserves_evidence(setup, fake, monkeypatch):
+    from climate_reanalysis.download import raw_path
+    from climate_reanalysis.manifest import manifest_path
+    names = {name for spec in VAR_SPECS.values() for name in spec.cds}
+    good = '10m_v_component_of_wind'
+    control = partial_results(fake, monkeypatch, names - {good})
+    first = tick(setup, fake)
+    task = first['tasks']['202608']
+    old_id = task['id']
+    assert task['stage'] == 'pending_download'
+    assert len(task['incomplete_files']) == 9
+    assert task['next_retry_at'] == (NOW + timedelta(hours=6)).isoformat()
+    assert first['publication_revision'] is None
+    work = pipeline.task_settings(setup, task)
+    old_good_bytes = raw_path(work.raw_dir, '202608', good).read_bytes()
+    old_bad_bytes = raw_path(work.raw_dir, '202608', '2m_temperature').read_bytes()
+    assert not manifest_path(work.manifest_dir, '202608', 'ssrd').exists()
+    assert not manifest_path(work.manifest_dir, '202608', 'si10').exists()
+    tick(setup, fake, now=NOW + timedelta(hours=5))
+    assert fake[0].submits == 10
+    control['names'].clear()
+    result = tick(setup, fake, now=NOW + timedelta(hours=6))
+    new = result['tasks']['202608']
+    assert new['stage'] == 'complete' and new['id'] != old_id
+    assert fake[0].submits == 19
+    assert raw_path(work.raw_dir, '202608', good).read_bytes() == old_good_bytes
+    assert raw_path(work.raw_dir, '202608', '2m_temperature').read_bytes() == old_bad_bytes
+    assert (setup.store_dir / '.pipeline/history' / f'{old_id}.json').exists()
+    assert new['jobs'][good]['request_id'] == task['jobs'][good]['request_id']
+    assert set(new['incomplete_recoveries'][-1]['reused_files']) == {good}
+    assert result['published_months']['202608']['hours'] == 744
+
+
+def test_old_pending_restore_incomplete_results_enter_content_recovery(setup, fake, monkeypatch):
+    from climate_reanalysis.manifest import write_manifest
+    from climate_reanalysis.download import raw_path
+    partial_results(fake, monkeypatch, {'2m_temperature'})
+    result = tick(setup, fake)
+    journal = Journal(setup.store_dir)
+    task = journal.data['tasks']['202608']
+    work = pipeline.task_settings(setup, task)
+    # Reproduce the deployed pre-fix state, including an invalid ready manifest.
+    write_manifest(work.manifest_dir, '202608', 't2m',
+                   [raw_path(work.raw_dir, '202608', '2m_temperature')], setup.area)
+    task.update(stage='pending_restore', attempts=15, last_error='old time-axis error',
+                next_retry_at=None)
+    task.pop('incomplete_files', None)
+    journal.save()
+    result = tick(setup, fake)
+    recovered = result['tasks']['202608']
+    assert recovered['stage'] == 'pending_download'
+    assert list(recovered['incomplete_files']) == ['2m_temperature']
+    assert recovered['next_retry_at'] == (NOW + timedelta(hours=6)).isoformat()
+    assert fake[0].submits == 10
+    assert result['publication_revision'] is None
+
+
+def test_content_recovery_does_not_abandon_accepted_jobs(setup, fake, monkeypatch):
+    from climate_reanalysis.manifest import manifest_path
+    partial_results(fake, monkeypatch, {'surface_solar_radiation_downwards'})
+    original = fake[0].submit
+
+    def submit(dataset, request):
+        remote = original(dataset, request)
+        if request['variable'] == ['10m_v_component_of_wind']:
+            remote.status = 'accepted'
+        return remote
+
+    monkeypatch.setattr(fake[0], 'submit', submit)
+    first = tick(setup, fake)
+    task = first['tasks']['202608']
+    accepted = task['jobs']['10m_v_component_of_wind']['request_id']
+    assert task['stage'] == 'pending_download' and not task['last_error']
+    work = pipeline.task_settings(setup, task)
+    assert not manifest_path(work.manifest_dir, '202608', 'ssrd').exists()
+    fake[0].remotes[accepted].status = 'successful'
+    result = tick(setup, fake)
+    assert fake[0].submits == 10
+    assert result['tasks']['202608']['jobs']['10m_v_component_of_wind']['request_id'] == accepted
+    assert result['tasks']['202608']['incomplete_files']
+
+
+def test_operator_can_advance_targeted_content_recovery_after_inspection(setup, fake, monkeypatch):
+    control = partial_results(fake, monkeypatch, {'2m_temperature'})
+    first = tick(setup, fake)
+    old = first['tasks']['202608']['id']
+    pipeline.retry_task(setup, '202608')
+    fresh = Journal.read(setup.store_dir)['tasks']['202608']
+    assert fresh['id'] != old and fresh['stage'] == 'pending_download'
+    assert fresh['next_retry_at'] is None
+    assert fake[0].submits == 10  # the recovery command itself performs no POST
+    control['names'].clear()
+    result = tick(setup, fake)
+    assert result['counts'] == {'complete': 1}
+    assert fake[0].submits == 11
+
+
+def test_reused_file_integrity_failure_keeps_old_attempt_and_issues_no_requests(setup, fake, monkeypatch):
+    from climate_reanalysis.download import raw_path
+    partial_results(fake, monkeypatch, {'2m_temperature'})
+    first = tick(setup, fake)
+    task = first['tasks']['202608']
+    work = pipeline.task_settings(setup, task)
+    raw_path(work.raw_dir, '202608', 'surface_pressure').write_bytes(b'corrupt test file')
+    result = tick(setup, fake, now=NOW + timedelta(hours=6))
+    assert result['tasks']['202608']['id'] == task['id']
+    assert 'downloaded file changed' in result['tasks']['202608']['last_error']
+    assert fake[0].submits == 10
+    assert result['publication_revision'] is None
+
+
+def test_failed_month_does_not_block_older_refresh_with_one_slot(setup, fake):
+    # August becomes due for refresh in December; September holds the sole slot
+    # in a processing backoff, with no CDS requests still running.
+    tick(setup, fake)
+    journal = Journal(setup.store_dir)
+    base = store.store_path(setup.store_dir, '202609')
+    task = pipeline._create_task('202609', ['t2m'], 'update', NOW, base)
+    later = datetime(2026, 12, 11, tzinfo=timezone.utc)
+    task.update(stage='pending_restore', last_error='incomplete month',
+                next_retry_at=(later + timedelta(hours=24)).isoformat())
+    journal.data['tasks']['202609'] = task
+    journal.save()
+    fake[0].initial = 'accepted'
+    settings = setup.model_copy(update={'max_active_months': 1, 'publish_lag_days': 100})
+    result = tick(settings, fake, now=later, refresh=True)
+    assert result['tasks']['202608']['kind'] == 'refresh'
+    assert result['tasks']['202608']['stage'] == 'pending_download'
+    assert fake[0].submits == 14
+    # The older failed task becoming due must not create requests on top of the
+    # still running refresh month, even though per-account slots remain free.
+    journal = Journal(setup.store_dir)
+    journal.data['tasks']['202609'].update(stage='pending_download', next_retry_at=None)
+    journal.save()
+    tick(settings, fake, now=later, refresh=True)
+    assert fake[0].submits == 14
+
+
 def test_crash_after_index_switch_recovers_without_new_generation(setup, fake, monkeypatch):
     original = publication.publish
     def crash(*args, **kwargs):
